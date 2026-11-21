@@ -6,7 +6,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 
-from . import i18n, keys
+from . import i18n, keys, update
 
 DEFAULT_SETTINGS: dict = {
     "show_notifications": True,
@@ -19,6 +19,12 @@ DEFAULT_SETTINGS: dict = {
     "language": "en",
     "macro_start_hotkey": "",
     "macro_stop_hotkey": "",
+    "update_check": True,
+    "update_private": False,
+    "update_url": update.DEFAULT_URL,
+    "update_interval_hours": 6,
+    "update_token": "",
+    "update_token_env": update.DEFAULT_TOKEN_ENV,
 }
 
 DEFAULT_HOTKEYS: list[dict] = [
@@ -366,6 +372,16 @@ def load(path: str) -> Config:
             300, min(5000, int(cfg.settings["leader_timeout_ms"])))
     except (TypeError, ValueError):
         cfg.settings["leader_timeout_ms"] = DEFAULT_SETTINGS["leader_timeout_ms"]
+
+    try:
+        cfg.settings["update_interval_hours"] = max(
+            1, min(168, int(cfg.settings["update_interval_hours"])))
+    except (TypeError, ValueError):
+        cfg.settings["update_interval_hours"] = DEFAULT_SETTINGS["update_interval_hours"]
+    for name in ("update_url", "update_token", "update_token_env"):
+        cfg.settings[name] = str(cfg.settings.get(name) or "").strip()
+    if not cfg.settings["update_url"]:
+        cfg.settings["update_url"] = DEFAULT_SETTINGS["update_url"]
 
     requested_lang = str(cfg.settings.get("language") or "").strip().lower()
     lang = i18n.normalize(requested_lang)

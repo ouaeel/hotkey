@@ -131,6 +131,12 @@ app is running is enough if `reload_on_change` is `true` (default).
 | `typing_delay_ms` | Delay between typed characters (0–50 ms) |
 | `hold_ms` | Long-press / double-click threshold in ms (150–3000, default 400) |
 | `suspend_hotkey` | Shortcut that pauses/resumes everything (always active) |
+| `update_check` | Check GitHub for a newer release on startup (default `true`) |
+| `update_private` | Skip network calls until a token is set (default `false`) |
+| `update_interval_hours` | Repeat interval, 1–168 hours (default `6`) |
+| `update_url` | GitHub `releases/latest` API URL |
+| `update_token` | Optional GitHub token; leave empty and use an env var instead |
+| `update_token_env` | Environment variable holding a token (default `GITHUB_TOKEN`) |
 
 The settings window's top header has a ⚙ button to the right of
 **Open hotkeys.json**. It opens a small **Quick settings** window containing the
@@ -146,6 +152,22 @@ Interface fonts use a 1.2× boost with a minimum UI scale of 1.1, so labels and
 the hotkey list stay readable on high-DPI and standard displays alike. While the
 settings window is open, firing a saved shortcut (press, double-click or
 long-press) selects and briefly highlights its row.
+
+### Update checker
+
+Shortly after startup, and every 6 hours by default, the app quietly asks GitHub
+for the latest release. If a newer stable version exists, a tray balloon appears
+and the tray menu shows **Update available: x.y.z** plus **Open releases page**.
+**Check for updates** in the tray menu runs it immediately and also confirms when
+you are up to date. The check uses a short-lived background thread, times out
+after 8 seconds, and never blocks hotkeys.
+
+The default repository is `ouaeel/hotkey`. For a **private** repo, GitHub requires
+a token: either set `settings.update_token`, or put a token with `repo` access in
+the `GITHUB_TOKEN` environment variable (or in the variable named by
+`update_token_env`). Set `update_private` to `true` to skip the network entirely
+until a token exists (no needless 404s or TLS threads); public repos need no
+token and can leave it `false`. Set `update_check` to `false` to disable entirely.
 
 ### Long press, double click and chords
 
@@ -169,6 +191,11 @@ release both → `J+K`.
 
 `hold_ms` lives in `settings` (150–3000 ms) and can be overridden per hotkey
 with `"hold_ms": 600` in its Advanced JSON.
+
+If `press` and `hold` are both configured for the **same** combo, they no longer
+double-fire: a quick release runs only `press`, while holding past `hold_ms`
+runs only `hold`. A side button that belongs to a chord keeps a generous release
+window so the chord can cancel it, but a matured hold still wins.
 
 ### Per-app hotkeys
 

@@ -26,7 +26,7 @@ import winreg
 
 from logging.handlers import RotatingFileHandler
 
-from . import actions, config, hooks, i18n, icon, keys, macro, win32
+from . import actions, config, hooks, i18n, icon, keys, macro, update, win32
 from . import __version__
 
 APP_NAME = "Hotkey"
@@ -40,9 +40,12 @@ WM_QUIT_APP = win32.WM_APP + 4
 WM_HOOK_FIRE = win32.WM_APP + 6
 WM_PAUSE = win32.WM_APP + 7
 WM_MACROKEY = win32.WM_APP + 8
+WM_UPDATE = win32.WM_APP + 9
 
 TIMER_WATCH = 1
 TIMER_HOLD = 2
+TIMER_UPDATE = 3
+UPDATE_FIRST_DELAY_MS = 10000
 TRAY_UID = 1
 # Only the two side buttons are ever eaten by the mouse hook. Swallowing a
 # left/right/middle click (which a chord like "Mouse5+MouseLeft" used to do)
@@ -63,6 +66,8 @@ CMD_SUSPEND = 2004
 CMD_LOG = 2005
 CMD_QUIT = 2006
 CMD_MACRO = 2007
+CMD_UPDATE = 2008
+CMD_RELEASES = 2009
 CMD_PROFILE_BASE = 3000
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -112,6 +117,11 @@ class App:
         # Recent hotkey fires, drained by the settings window to flash its row.
         # Bounded so a closed window cannot accumulate events forever.
         self.fire_events: queue.Queue[int] = queue.Queue(maxsize=1)
+        # Update checks run in short-lived daemon threads and report back by
+        # posting a message, keeping the main loop single-threaded.
+        self._update_info: update.UpdateInfo | None = None
+        self._update_manual = False
+        self._update_busy = False
         self.macro = macro.MacroControl()
         self.macro.on_show = self.show_macro_panel
         self._macro_panel = None
@@ -143,6 +153,7 @@ class App:
         self._register_all()
         self._update_tray()
         win32.user32.SetTimer(win32.HWND(self.hwnd), TIMER_WATCH, 2500, None)
+        self._schedule_update_check(UPDATE_FIRST_DELAY_MS)
         log.info("running: %d hotkeys, config=%s", self.active_count, self.path)
         if self._failures:
             log.warning("%d hotkey(s) unavailable", len(self._failures))
@@ -617,7 +628,9 @@ class App:
         self._run_entry(entry, prepare_only=True)
 
     def _run_entry(self, entry: config.Entry, prepare_only: bool = False) -> None:
-        log.info("hotkey %s -> %s", entry.display, entry.action)
+        detail = str(entry.value or entry.description or "").strip()
+        log.info("hotkey %s -> %s%s", entry.display, entry.action,
+                 f" ({detail})" if detail else "")
         try:
             what = actions.run(entry, self, prepare_only=prepare_only)
             log.debug("ok: %s", what)
@@ -670,6 +683,71 @@ class App:
             win32.tray_balloon(self.hwnd, TRAY_UID, title, text, kind)
         except Exception:  # pragma: no cover
             pass
+
+    # -- updates --------------------------------------------------------------
+    def _schedule_update_check(self, delay_ms: int) -> None:
+        if not self.hwnd:
+            return
+        if not self.cfg.settings.get("update_check", True):
+            win32.user32.KillTimer(win32.HWND(self.hwnd), TIMER_UPDATE)
+            return
+        win32.user32.SetTimer(win32.HWND(self.hwnd), TIMER_UPDATE, delay_ms, None)
+
+    def _check_updates(self, manual: bool = False) -> None:
+        if self._update_busy:
+            return
+        if not manual and not self.cfg.settings.get("update_check", True):
+            return
+        self._update_manual = manual
+        url = str(self.cfg.settings.get("update_url") or update.DEFAULT_URL)
+        token = update.token_from(self.cfg.settings)
+        if self.cfg.settings.get("update_private") and not token:
+            log.debug("update check skipped: private repo needs a token")
+            if manual:
+                self.notify(self.t("Update available"),
+                            self.t("Add a GitHub token to check this private repo"),
+                            force=True)
+            return
+        self._update_busy = True
+
+        def worker() -> None:
+            info = None
+            try:
+                info = update.check(url, token)
+            except Exception as exc:
+                log.debug("update check skipped: %s", exc)
+                return
+            finally:
+                self._update_busy = False
+            if info is not None or manual:
+                self._update_info = info
+                try:
+                    win32.user32.PostMessageW(win32.HWND(self.hwnd), WM_UPDATE, 0, 0)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, name="update-check", daemon=True).start()
+
+    def _on_update_result(self) -> None:
+        info = self._update_info
+        manual = self._update_manual
+        self._update_manual = False
+        if info is None:
+            if manual:
+                self.notify(self.t("Update available"),
+                            self.t("You are up to date"), force=True)
+            return
+        log.info("update available: %s", info.version)
+        self.notify(self.t("Update available"),
+                    self.t("Version {version} is available", version=info.version))
+
+    def _releases_url(self) -> str:
+        if self._update_info is not None:
+            return self._update_info.url
+        base = str(self.cfg.settings.get("update_url") or update.DEFAULT_URL)
+        if base.rstrip("/").endswith("/releases/latest"):
+            return base.rstrip("/")[:-len("/releases/latest")] + "/releases"
+        return "https://github.com/ouaeel/hotkey/releases"
 
     def open_config(self) -> None:
         config.ensure_default(self.path)
@@ -791,6 +869,17 @@ class App:
                     for b in fired:
                         self._post_fire(b.index)
                     self._sync_hold_timer()
+                elif int(wparam) == TIMER_UPDATE:
+                    self._check_updates()
+                    hours = self.cfg.settings.get("update_interval_hours", 6)
+                    try:
+                        interval = max(1, int(hours)) * 3600 * 1000
+                    except (TypeError, ValueError):
+                        interval = 6 * 3600 * 1000
+                    self._schedule_update_check(interval)
+                return 0
+            if msg == WM_UPDATE:
+                self._on_update_result()
                 return 0
             if msg == WM_HOOK_FIRE:
                 self._on_hook_fire(int(wparam))
@@ -873,6 +962,10 @@ class App:
             self.toggle_suspend()
         elif cmd == CMD_LOG:
             self.open_log()
+        elif cmd == CMD_UPDATE:
+            self._check_updates(manual=True)
+        elif cmd == CMD_RELEASES:
+            self.open_path(self._releases_url())
         elif cmd == CMD_QUIT:
             self.request_quit()
         elif CMD_PROFILE_BASE <= cmd < CMD_PROFILE_BASE + 1000:
@@ -933,6 +1026,12 @@ class App:
             (CMD_SUSPEND, self.t("Suspend all hotkeys"), self.suspended, False),
             (0, "---", False, False),
             (CMD_LOG, self.t("Open log"), False, False),
+            (CMD_RELEASES, self.t("Open releases page"), False, False),
+            (CMD_UPDATE,
+             self.t("Update available: {version}",
+                    version=self._update_info.version)
+             if self._update_info else self.t("Check for updates"),
+             False, False),
             (CMD_QUIT, self.t("Quit"), False, False),
         ]
         items += extra

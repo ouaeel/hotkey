@@ -124,6 +124,9 @@ class TriggerEngine:
         self._tap: dict[int, tuple[Binding, float]] = {}
         self._hold: dict[int, tuple[Binding, float]] = {}
         self._double: dict[int, tuple[Binding, float]] = {}
+        # A plain "press" sharing its combo with hold/tap/double must wait:
+        # (press binding, press time, owning hold index, hold deadline).
+        self._pending_press: dict[int, tuple[Binding, float, int | None, float]] = {}
         self._armed: set[int] = set()
         self._scoped_vks = {vk for b in self.bindings if b.apps for vk in b.vks}
         self._leader_timeout = max(300, min(5000, int(leader_timeout_ms)))
@@ -251,6 +254,11 @@ class TriggerEngine:
                         self._double = {i: (db, ds)
                                         for i, (db, ds) in self._double.items()
                                         if db.vks[0] not in b.vks}
+                    if self._pending_press:
+                        self._pending_press = {
+                            i: value for i, value in self._pending_press.items()
+                            if value[0].vks[0] not in b.vks
+                        }
                     fired.append(b)
             elif b.vks[0] == vk:
                 if b.trigger == "hold":
@@ -261,20 +269,47 @@ class TriggerEngine:
                     first = self._double.get(b.index)
                     if first is not None and now - first[1] <= b.hold_ms / 1000.0:
                         self._double.pop(b.index, None)
+                        self._cancel_siblings(b)
                         fired.append(b)
                     else:
                         self._double[b.index] = (b, now)
                 else:
-                    fired.append(b)
+                    # If hold/tap/double owns this same combo, a plain press
+                    # must not fire on key-down: hold would run after it too.
+                    delayed = {hb.trigger for hb in eligible
+                               if hb.mods == mods and hb.vks == b.vks
+                               and hb.trigger != "press" and not hb.seq}
+                    if not delayed:
+                        fired.append(b)
+                    elif "hold" in delayed:
+                        hold = next(
+                            (hb for hb in eligible
+                             if hb.mods == mods and hb.vks == b.vks
+                             and hb.trigger == "hold" and not hb.seq), None)
+                        self._pending_press[b.index] = (
+                            b, now, hold.index if hold else None,
+                            now + hold.hold_ms / 1000.0 if hold else now)
+                    # tap/double alone replaces press entirely.
         return fired
 
     def feed_up(self, vk: int, now: float) -> list[Binding]:
         self.pressed.discard(vk)
         fired: list[Binding] = []
         for idx, (b, started) in list(self._tap.items()):
+            if idx not in self._tap:
+                continue
             if b.vks[0] == vk:
                 self._tap.pop(idx, None)
                 if now - started <= b.hold_ms / 1000.0:
+                    fired.append(b)
+                    self._cancel_siblings(b)
+        # A press that was waiting on a hold fires only if the hold never
+        # matured (i.e. the button was released before hold_ms).
+        for idx, (b, _started, _hold_idx, deadline) in list(
+                self._pending_press.items()):
+            if b.vks[0] == vk:
+                self._pending_press.pop(idx, None)
+                if now < deadline:
                     fired.append(b)
         for idx, (b, _) in list(self._hold.items()):
             if b.vks[0] == vk:
@@ -290,16 +325,28 @@ class TriggerEngine:
         if self._leader and now >= self._leader_deadline:
             self._clear_leader()
         fired: list[Binding] = []
+
+        def drop_pending(hold_index: int) -> None:
+            for pidx, value in list(self._pending_press.items()):
+                if value[2] == hold_index:
+                    self._pending_press.pop(pidx, None)
+
         for idx, (b, deadline) in list(self._hold.items()):
+            if idx not in self._hold:
+                continue
             if now < deadline:
                 continue
             if mods != b.mods or not is_down(b.vks[0]):
                 self._hold.pop(idx, None)
+                drop_pending(idx)
                 continue
             if b.apps and app is not None and not win32.app_matches(b.apps, app):
                 self._hold.pop(idx, None)
+                drop_pending(idx)
                 continue
             self._hold.pop(idx, None)
+            drop_pending(idx)
+            self._cancel_siblings(b)
             fired.append(b)
         return fired
 
@@ -316,11 +363,22 @@ class TriggerEngine:
         self._tap.clear()
         self._hold.clear()
         self._double.clear()
+        self._pending_press.clear()
         self._armed.clear()
         self._clear_leader()
 
     def _by_index(self) -> dict[int, Binding]:
         return {b.index: b for b in self.bindings}
+
+    def _cancel_siblings(self, b: Binding) -> None:
+        """Only one delayed trigger may own a physical combo at a time."""
+        for store in (self._tap, self._hold, self._double):
+            for idx, (other, _value) in list(store.items()):
+                if other.mods == b.mods and other.vks == b.vks:
+                    store.pop(idx, None)
+        for pidx, value in list(self._pending_press.items()):
+            if value[0].mods == b.mods and value[0].vks == b.vks:
+                self._pending_press.pop(pidx, None)
 
 
 class KeyboardHook:

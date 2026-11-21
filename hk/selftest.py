@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import queue
 import sys
 import tempfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from . import actions, config, i18n, icon, keys, macro, win32
+from . import actions, config, i18n, icon, keys, macro, update, win32
 
 
 class Results:
@@ -219,7 +222,35 @@ def _test_engine() -> str:
     eng.feed_down(74, 0, 3.0)
     eng.feed_up(74, 3.1)
     assert eng.due(3.5, 0, lambda v: True) == []
-    return "chord + tap + hold"
+    # press + hold on the same combo must not double-fire.  A quick release
+    # runs only press; holding past the deadline runs only hold.
+    ctrl = keys.MOD_CONTROL
+    press = Binding(index=10, mods=ctrl, vks=(6,), trigger="press")
+    hold = Binding(index=11, mods=ctrl, vks=(6,), trigger="hold", hold_ms=400)
+    eng = TriggerEngine([press, hold])
+    assert eng.feed_down(6, ctrl, 4.0) == []
+    assert [b.index for b in eng.feed_up(6, 4.1)] == [10], "quick press lost"
+    assert eng.due(4.5, ctrl, lambda v: True) == []
+    assert eng.feed_down(6, ctrl, 5.0) == []
+    assert eng.due(5.3, ctrl, lambda v: True) == []
+    assert [b.index for b in eng.due(5.5, ctrl, lambda v: True)] == [11], "hold lost"
+    assert eng.feed_up(6, 5.6) == [], "press fired after hold"
+    # tap owning the combo replaces press entirely
+    tap = Binding(index=12, mods=ctrl, vks=(6,), trigger="tap", hold_ms=400)
+    eng = TriggerEngine([press, tap])
+    assert eng.feed_down(6, ctrl, 6.0) == []
+    assert [b.index for b in eng.feed_up(6, 6.1)] == [12]
+    # The chord-safe tap window is 30 s.  A matured hold must still cancel it,
+    # otherwise releasing after the hold would fire both actions.
+    chord_tap = Binding(index=13, mods=0, vks=(6,), trigger="tap", hold_ms=30000)
+    chord_hold = Binding(index=14, mods=0, vks=(6,), trigger="hold", hold_ms=400)
+    eng = TriggerEngine([chord_tap, chord_hold])
+    assert eng.feed_down(6, 0, 7.0) == []
+    assert [b.index for b in eng.due(7.5, 0, lambda v: True)] == [14]
+    assert eng.feed_up(6, 7.6) == [], "chord tap fired after hold"
+    assert eng.feed_down(6, 0, 8.0) == []
+    assert [b.index for b in eng.feed_up(6, 8.1)] == [13], "quick tap lost"
+    return "chord + tap + hold + trigger conflicts"
 
 
 def _test_app_scope() -> str:
@@ -441,6 +472,48 @@ def _test_validation() -> str:
     return "config warnings + safe macro keys"
 
 
+def _test_update() -> str:
+    payloads = {
+        "/new": {
+            "tag_name": "v9.9.9", "prerelease": False,
+            "html_url": "https://github.com/ouaeel/hotkey/releases/tag/v9.9.9",
+            "body": "next release",
+            "assets": [{"name": "hotkey-v9.9.9-source.zip",
+                        "browser_download_url": "https://example/hotkey-v9.9.9-source.zip"}],
+        },
+        "/old": {"tag_name": "v0.0.1", "prerelease": False, "assets": []},
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(payloads.get(self.path, {})).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        info = update.check(base + "/new", token="test")
+        assert info is not None and info.version == "9.9.9", info
+        assert info.url.endswith("hotkey-v9.9.9-source.zip"), info
+        assert update.check(base + "/old") is None
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert update.is_newer("v1.0.1", "1.0.0")
+    assert not update.is_newer("1.0.0", "1.0.0")
+    assert not update.is_newer("bad", "1.0.0")
+    return "version compare + release parsing"
+
+
 def run(config_path: str, full: bool = False) -> int:
     print("Hotkey self-test")
     print(f"  python      {sys.version.split()[0]}")
@@ -459,6 +532,7 @@ def run(config_path: str, full: bool = False) -> int:
     results.check("profiles", _test_profiles)
     results.check("macro control", _test_macro_control)
     results.check("validation + safe macro keys", _test_validation)
+    results.check("update checker", _test_update)
     results.check("foreground app detection", _test_foreground)
     if full:
         results.check("clipboard (modifies + restores)", _test_clipboard)
