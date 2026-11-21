@@ -11,7 +11,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from . import config, i18n, icon, keys, win32
+from . import __version__, config, i18n, icon, keys, win32
 from .actions import SPECS
 
 FONT = "Segoe UI"
@@ -298,6 +298,12 @@ class SettingsWindow:
 
     def _close_language_window(self) -> None:
         """Destroy the small language window if it is open."""
+        job = getattr(self, "_lang_win_update_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
         win = getattr(self, "_lang_win", None)
         if win is not None:
             try:
@@ -305,10 +311,75 @@ class SettingsWindow:
             except tk.TclError:
                 pass
         self._lang_win = None
+        self._lang_win_update_job = None
         self._lang_win_combo = None
         self._lang_win_notify = None
         self._lang_win_notify_var = None
         self._lang_win_apply = None
+        self._lang_win_version_var = None
+        self._lang_win_latest_var = None
+        self._lang_win_update_var = None
+        self._lang_win_check = None
+
+    def _update_status_snapshot(self) -> dict:
+        """Read the app's update status, with a fallback for simple owners."""
+        snapshot = getattr(self.app, "update_snapshot", None)
+        if callable(snapshot):
+            try:
+                return snapshot()
+            except Exception:
+                pass
+        return {
+            "state": "idle", "version": "",
+            "message": "Not checked yet", "kwargs": {},
+            "current": __version__,
+        }
+
+    def _apply_update_status(self, status: dict) -> None:
+        """Reflect one update snapshot in the gear window."""
+        state = str(status.get("state") or "idle")
+        latest = str(status.get("version") or "")
+        if state == "new" and latest:
+            latest_text = latest
+        elif state == "current":
+            latest_text = self.t("You are up to date")
+        else:
+            latest_text = "—"
+        version_var = getattr(self, "_lang_win_latest_var", None)
+        if version_var is not None:
+            version_var.set(latest_text)
+        key = str(status.get("message") or "Not checked yet")
+        kwargs = status.get("kwargs")
+        if not isinstance(kwargs, dict):
+            kwargs = {}
+        status_var = getattr(self, "_lang_win_update_var", None)
+        if status_var is not None:
+            status_var.set(self.t(key, **kwargs))
+        button = getattr(self, "_lang_win_check", None)
+        if button is not None:
+            try:
+                button.configure(
+                    state="disabled" if state == "checking" else "normal")
+            except tk.TclError:
+                pass
+
+    def _poll_update(self) -> None:
+        """Drain update results on the Tk thread; never block the app loop."""
+        win = getattr(self, "_lang_win", None)
+        events = getattr(self.app, "update_events", None)
+        if win is None or events is None:
+            return
+        try:
+            if not win.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
+            while True:
+                self._apply_update_status(events.get_nowait())
+        except queue.Empty:
+            pass
+        self._lang_win_update_job = self.root.after(300, self._poll_update)
 
     def _show_language_window(self) -> None:
         """Open the gear window with language and notification settings."""
@@ -366,6 +437,53 @@ class SettingsWindow:
         self._lang_win_notify.pack(side=start)
         self._lang_win_notify_var = notify_var
 
+        current_row = ttk.Frame(body)
+        current_row.pack(fill="x", pady=(PAD_L, 0))
+        ttk.Label(current_row, text=self.t("Current version:"),
+                  style="Muted.TLabel", justify=just).pack(side=start)
+        self._lang_win_version_var = tk.StringVar(master=win, value=__version__)
+        ttk.Label(current_row, textvariable=self._lang_win_version_var,
+                  justify=just).pack(side=start, padx=_pad(self.lang, 8))
+
+        newest_row = ttk.Frame(body)
+        newest_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(newest_row, text=self.t("New version:"),
+                  style="Muted.TLabel", justify=just).pack(side=start)
+        self._lang_win_latest_var = tk.StringVar(master=win, value="—")
+        ttk.Label(newest_row, textvariable=self._lang_win_latest_var,
+                  justify=just).pack(side=start, padx=_pad(self.lang, 8))
+
+        update_status = tk.StringVar(master=win, value="")
+        self._lang_win_update_var = update_status
+        ttk.Label(body, textvariable=update_status, style="Muted.TLabel",
+                  justify=just, wraplength=300).pack(fill="x", pady=(6, 0))
+
+        update_buttons = ttk.Frame(body)
+        update_buttons.pack(fill="x", pady=(8, 0))
+
+        def check_version() -> None:
+            self._apply_update_status(
+                {"state": "checking", "message": "Checking…"})
+            request = getattr(self.app, "request_update_check", None)
+            if callable(request):
+                request()
+
+        def open_releases() -> None:
+            opener = getattr(self.app, "open_path", None)
+            snapshot = self._update_status_snapshot()
+            url = str(snapshot.get("url") or "")
+            if callable(opener) and url:
+                opener(url)
+
+        self._lang_win_check = ttk.Button(
+            update_buttons, text=self.t("Check version"), command=check_version)
+        self._lang_win_check.pack(side=start)
+        ttk.Button(update_buttons, text=self.t("Open releases page"),
+                   command=open_releases).pack(
+                       side=start, padx=_pad(self.lang, 0, 8))
+
+        self._apply_update_status(self._update_status_snapshot())
+
         def close() -> None:
             self._close_language_window()
 
@@ -411,6 +529,8 @@ class SettingsWindow:
         win.bind("<Escape>", lambda _e: close())
         combo.bind("<Return>", lambda _e: apply())
 
+        if getattr(self.app, "update_events", None) is not None:
+            self._lang_win_update_job = self.root.after(300, self._poll_update)
         win.update_idletasks()
         width, height = win.winfo_width(), win.winfo_height()
         parent_x, parent_y = self.root.winfo_rootx(), self.root.winfo_rooty()
@@ -541,7 +661,7 @@ class SettingsWindow:
             command=self._show_language_window)
         self.btn_language.pack(side=start, padx=_pad(self.lang, 8))
         _tip(self.btn_language, self.status_var,
-             lambda: (f"{self.t('Quick settings')} · "
+             lambda: (f"{self.t('Quick settings')} · v{__version__} · "
                       f"{self.t('Show notifications')}: "
                       f"{self.t('On' if self._notifications_enabled() else 'Off')}"))
         _tip(self.btn_reload, self.status_var,

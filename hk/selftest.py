@@ -514,6 +514,36 @@ def _test_update() -> str:
     return "version compare + release parsing"
 
 
+def _test_update_status() -> str:
+    from .app import App
+
+    app = App.__new__(App)
+    app.hwnd = 0
+    app.use_tray = False
+    app.cfg = config.Config(path="")
+    app.cfg.settings.update({
+        "language": "en",
+        "update_private": True,
+        "update_url": update.DEFAULT_URL,
+        "update_token": "",
+        "update_token_env": update.DEFAULT_TOKEN_ENV,
+    })
+    app._update_info = None
+    app._update_manual = False
+    app._update_busy = False
+    app.update_events = queue.Queue(maxsize=4)
+    app._update_state = {
+        "state": "idle", "version": "", "message": "Not checked yet",
+        "kwargs": {}, "url": update.DEFAULT_URL,
+    }
+    app._check_updates(manual=True)
+    status = app.update_events.get_nowait()
+    assert status["state"] == "blocked", status
+    assert status["message"] == "Add a GitHub token to check this private repo"
+    assert app.update_snapshot()["current"] == update.__version__
+    return "gear status events"
+
+
 def run(config_path: str, full: bool = False) -> int:
     print("Hotkey self-test")
     print(f"  python      {sys.version.split()[0]}")
@@ -533,6 +563,7 @@ def run(config_path: str, full: bool = False) -> int:
     results.check("macro control", _test_macro_control)
     results.check("validation + safe macro keys", _test_validation)
     results.check("update checker", _test_update)
+    results.check("gear update status", _test_update_status)
     results.check("foreground app detection", _test_foreground)
     if full:
         results.check("clipboard (modifies + restores)", _test_clipboard)

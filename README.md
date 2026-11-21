@@ -140,10 +140,12 @@ app is running is enough if `reload_on_change` is `true` (default).
 
 The settings window's top header has a ⚙ button to the right of
 **Open hotkeys.json**. It opens a small **Quick settings** window containing the
-language selector (English, Français and العربية) and a **Show notifications**
-on/off switch. Hovering the gear shows its current notification state in the
-status bar. Changes save `settings.language` / `settings.show_notifications`
-and immediately re-translate the editor and tray menu.
+language selector (English, Français and العربية), a **Show notifications**
+on/off switch, and the update panel: **Current version**, **New version**,
+**Check version** and **Open releases page**. Hovering the gear shows the version
+and current notification state in the status bar. Changes save
+`settings.language` / `settings.show_notifications` and immediately re-translate
+the editor and tray menu.
 العربية switches the whole interface to right-to-left layout; reopen the macro
 control window to translate that one. Invalid values fall back to English with
 a warning in the log.
@@ -159,8 +161,11 @@ Shortly after startup, and every 6 hours by default, the app quietly asks GitHub
 for the latest release. If a newer stable version exists, a tray balloon appears
 and the tray menu shows **Update available: x.y.z** plus **Open releases page**.
 **Check for updates** in the tray menu runs it immediately and also confirms when
-you are up to date. The check uses a short-lived background thread, times out
-after 8 seconds, and never blocks hotkeys.
+you are up to date. The **Check version** button in the ⚙ **Quick settings**
+window does the same thing and shows **Not checked yet**, **Checking…**,
+**You are up to date**, the new version number, or a clear error in that window.
+The check uses a short-lived background thread, times out after 8 seconds, and
+never blocks hotkeys.
 
 The default repository is `ouaeel/hotkey`. For a **private** repo, GitHub requires
 a token: either set `settings.update_token`, or put a token with `repo` access in

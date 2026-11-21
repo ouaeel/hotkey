@@ -41,6 +41,7 @@ WM_HOOK_FIRE = win32.WM_APP + 6
 WM_PAUSE = win32.WM_APP + 7
 WM_MACROKEY = win32.WM_APP + 8
 WM_UPDATE = win32.WM_APP + 9
+WM_UPDATE_CHECK = win32.WM_APP + 10
 
 TIMER_WATCH = 1
 TIMER_HOLD = 2
@@ -122,6 +123,13 @@ class App:
         self._update_info: update.UpdateInfo | None = None
         self._update_manual = False
         self._update_busy = False
+        # Status snapshots for the gear window.  The Tk thread drains this
+        # queue on a short timer; nothing blocks the Win32 loop.
+        self.update_events: queue.Queue[dict] = queue.Queue(maxsize=4)
+        self._update_state: dict = {
+            "state": "idle", "version": "", "message": "Not checked yet",
+            "kwargs": {}, "url": self._releases_url(),
+        }
         self.macro = macro.MacroControl()
         self.macro.on_show = self.show_macro_panel
         self._macro_panel = None
@@ -693,8 +701,52 @@ class App:
             return
         win32.user32.SetTimer(win32.HWND(self.hwnd), TIMER_UPDATE, delay_ms, None)
 
+    def _publish_update(self, state: str, latest: str = "",
+                        message: str = "Not checked yet",
+                        **kwargs: object) -> dict:
+        """Store one status snapshot and hand it to the gear window."""
+        status = {
+            "state": state,
+            "version": str(latest or ""),
+            "message": message,
+            "kwargs": dict(kwargs),
+            "url": self._releases_url(),
+        }
+        self._update_state = status
+        try:
+            self.update_events.put_nowait(status)
+        except queue.Full:
+            try:
+                self.update_events.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.update_events.put_nowait(status)
+            except queue.Full:
+                pass
+        return status
+
+    def request_update_check(self, manual: bool = True) -> None:
+        """Ask the main loop to check, safe to call from the Tk thread."""
+        if not self.hwnd:
+            return
+        try:
+            win32.user32.PostMessageW(
+                win32.HWND(self.hwnd), WM_UPDATE_CHECK, 1 if manual else 0, 0)
+        except Exception:
+            pass
+
+    def update_snapshot(self) -> dict:
+        """Current version/status for a window that just opened."""
+        status = dict(self._update_state)
+        status["current"] = __version__
+        status["url"] = self._releases_url()
+        return status
+
     def _check_updates(self, manual: bool = False) -> None:
         if self._update_busy:
+            if manual:
+                self._publish_update("checking", message="Checking…")
             return
         if not manual and not self.cfg.settings.get("update_check", True):
             return
@@ -702,13 +754,18 @@ class App:
         url = str(self.cfg.settings.get("update_url") or update.DEFAULT_URL)
         token = update.token_from(self.cfg.settings)
         if self.cfg.settings.get("update_private") and not token:
+            self._update_manual = False
             log.debug("update check skipped: private repo needs a token")
+            self._publish_update(
+                "blocked",
+                message="Add a GitHub token to check this private repo")
             if manual:
-                self.notify(self.t("Update available"),
+                self.notify(self.t("Check for updates"),
                             self.t("Add a GitHub token to check this private repo"),
                             force=True)
             return
         self._update_busy = True
+        self._publish_update("checking", message="Checking…")
 
         def worker() -> None:
             info = None
@@ -716,11 +773,19 @@ class App:
                 info = update.check(url, token)
             except Exception as exc:
                 log.debug("update check skipped: %s", exc)
+                if manual:
+                    self._publish_update("error", message="Update check failed")
                 return
             finally:
                 self._update_busy = False
             if info is not None or manual:
                 self._update_info = info
+                if info is not None:
+                    self._publish_update(
+                        "new", latest=info.version,
+                        message="Update available: {version}", version=info.version)
+                else:
+                    self._publish_update("current", message="You are up to date")
                 try:
                     win32.user32.PostMessageW(win32.HWND(self.hwnd), WM_UPDATE, 0, 0)
                 except Exception:
@@ -734,7 +799,7 @@ class App:
         self._update_manual = False
         if info is None:
             if manual:
-                self.notify(self.t("Update available"),
+                self.notify(self.t("Check for updates"),
                             self.t("You are up to date"), force=True)
             return
         log.info("update available: %s", info.version)
@@ -880,6 +945,9 @@ class App:
                 return 0
             if msg == WM_UPDATE:
                 self._on_update_result()
+                return 0
+            if msg == WM_UPDATE_CHECK:
+                self._check_updates(manual=bool(int(wparam)))
                 return 0
             if msg == WM_HOOK_FIRE:
                 self._on_hook_fire(int(wparam))
