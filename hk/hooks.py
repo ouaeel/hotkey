@@ -127,6 +127,11 @@ class TriggerEngine:
         # A plain "press" sharing its combo with hold/tap/double must wait:
         # (press binding, press time, owning hold index, hold deadline).
         self._pending_press: dict[int, tuple[Binding, float, int | None, float]] = {}
+        # A first click on a combo that also owns a "double" binding waits here
+        # until the double window closes.  Without this, press fires on the way
+        # down and double can never win (or press fires twice on a double click).
+        self._deferred: dict[tuple[int, tuple[int, ...]], tuple[Binding, float]] = {}
+        self._down_at: dict[int, float] = {}
         self._armed: set[int] = set()
         self._scoped_vks = {vk for b in self.bindings if b.apps for vk in b.vks}
         self._leader_timeout = max(300, min(5000, int(leader_timeout_ms)))
@@ -179,8 +184,16 @@ class TriggerEngine:
     def feed_down(self, vk: int, mods: int, now: float,
                   app: str = "") -> list[Binding]:
         if vk in self.pressed:
-            return []
+            # Key auto-repeat arrives as down/down/.../up.  Mouse buttons never
+            # repeat: a second down without an up means the release was lost
+            # (UAC prompt, reload mid-click).  Reset that button instead of
+            # leaving it stuck "pressed" and swallowing every future event.
+            if _keys.is_mouse_vk(vk) or now - self._down_at.get(vk, now) > 5.0:
+                self._reset_vk(vk)
+            else:
+                return []
         self.pressed.add(vk)
+        self._down_at[vk] = now
 
         if self._leader:
             if vk in MODIFIER_VKS:
@@ -234,75 +247,86 @@ class TriggerEngine:
             self._leader_hint = self._hint_for(self._leader, self._leader_step)
             return fired
 
+        # Chords are settled before single-button bindings.  The old loop
+        # armed tap/hold/double again for rows *after* the chord, so whether a
+        # chord cancelled its own buttons depended on config row order.
+        blocked: set[int] = set()
         for b in eligible:
-            if b.seq:
+            if b.seq or len(b.vks) <= 1 or b.mods != mods:
                 continue
-            if b.mods != mods:
+            if b.index in self._armed or not set(b.vks) <= self.pressed:
                 continue
-            if len(b.vks) > 1:
-                if set(b.vks) <= self.pressed and b.index not in self._armed:
-                    self._armed.add(b.index)
-                    if self._tap:
-                        self._tap = {i: (tb, ts)
-                                     for i, (tb, ts) in self._tap.items()
-                                     if tb.vks[0] not in b.vks}
-                    if self._hold:
-                        self._hold = {i: (hb, hd)
-                                      for i, (hb, hd) in self._hold.items()
-                                      if hb.vks[0] not in b.vks}
-                    if self._double:
-                        self._double = {i: (db, ds)
-                                        for i, (db, ds) in self._double.items()
-                                        if db.vks[0] not in b.vks}
-                    if self._pending_press:
-                        self._pending_press = {
-                            i: value for i, value in self._pending_press.items()
-                            if value[0].vks[0] not in b.vks
-                        }
-                    fired.append(b)
-            elif b.vks[0] == vk:
-                if b.trigger == "hold":
-                    self._hold[b.index] = (b, now + b.hold_ms / 1000.0)
-                elif b.trigger == "tap":
-                    self._tap[b.index] = (b, now)
-                elif b.trigger == "double":
-                    first = self._double.get(b.index)
-                    if first is not None and now - first[1] <= b.hold_ms / 1000.0:
-                        self._double.pop(b.index, None)
-                        self._cancel_siblings(b)
-                        fired.append(b)
-                    else:
-                        self._double[b.index] = (b, now)
+            self._armed.add(b.index)
+            self._cancel_vks(set(b.vks))
+            blocked.update(b.vks)
+            fired.append(b)
+
+        # Double-click owns the first click of its combo.  Defer press/tap
+        # until the window closes so a double click fires only the double
+        # action, and a single click still fires its press/tap action.
+        for d in eligible:
+            if (d.seq or d.trigger != "double" or d.mods != mods
+                    or len(d.vks) != 1 or d.vks[0] != vk or vk in blocked):
+                continue
+            first = self._double.get(d.index)
+            if first is not None and now - first[1] <= d.hold_ms / 1000.0:
+                self._double.pop(d.index, None)
+                self._cancel_vks(set(d.vks))
+                fired.append(d)
+                blocked.add(vk)
+            else:
+                self._double[d.index] = (d, now)
+
+        for b in eligible:
+            if b.seq or b.mods != mods or vk in blocked:
+                continue
+            if len(b.vks) > 1 or b.vks[0] != vk:
+                continue
+            double = self._double_for(eligible, b)
+            if b.trigger == "hold":
+                self._hold[b.index] = (b, now + b.hold_ms / 1000.0)
+            elif b.trigger == "tap":
+                if double is not None:
+                    self._defer(b, now, double)
                 else:
-                    # If hold/tap/double owns this same combo, a plain press
-                    # must not fire on key-down: hold would run after it too.
-                    delayed = {hb.trigger for hb in eligible
-                               if hb.mods == mods and hb.vks == b.vks
-                               and hb.trigger != "press" and not hb.seq}
-                    if not delayed:
-                        fired.append(b)
-                    elif "hold" in delayed:
-                        hold = next(
-                            (hb for hb in eligible
-                             if hb.mods == mods and hb.vks == b.vks
-                             and hb.trigger == "hold" and not hb.seq), None)
-                        self._pending_press[b.index] = (
-                            b, now, hold.index if hold else None,
-                            now + hold.hold_ms / 1000.0 if hold else now)
-                    # tap/double alone replaces press entirely.
+                    self._tap[b.index] = (b, now)
+            elif b.trigger == "double":
+                pass  # already arbitrated above
+            elif double is not None:
+                self._defer(b, now, double)
+            else:
+                # If hold/tap owns this combo, a plain press must wait too:
+                # holding should not fire both actions.
+                delayed = {hb.trigger for hb in eligible
+                           if hb.mods == mods and hb.vks == b.vks
+                           and hb.trigger != "press" and not hb.seq}
+                if not delayed:
+                    fired.append(b)
+                elif "hold" in delayed:
+                    hold = next(
+                        (hb for hb in eligible
+                         if hb.mods == mods and hb.vks == b.vks
+                         and hb.trigger == "hold" and not hb.seq), None)
+                    self._pending_press[b.index] = (
+                        b, now, hold.index if hold else None,
+                        now + hold.hold_ms / 1000.0 if hold else now)
+                # tap/double alone replaces press entirely.
         return fired
 
     def feed_up(self, vk: int, now: float) -> list[Binding]:
         self.pressed.discard(vk)
+        self._down_at.pop(vk, None)
         fired: list[Binding] = []
-        for idx, (b, started) in list(self._tap.items()):
+        for idx, (b, _started) in list(self._tap.items()):
             if idx not in self._tap:
                 continue
             if b.vks[0] == vk:
                 self._tap.pop(idx, None)
-                if now - started <= b.hold_ms / 1000.0:
-                    fired.append(b)
-                    self._cancel_siblings(b)
+                # A matured hold already cancelled the tap.  Otherwise a
+                # release always completes it: an elapsed-time cut-off here
+                # made a long hold on a chord-sharing button fire nothing.
+                fired.append(b)
+                self._cancel_siblings(b)
         # A press that was waiting on a hold fires only if the hold never
         # matured (i.e. the button was released before hold_ms).
         for idx, (b, _started, _hold_idx, deadline) in list(
@@ -331,6 +355,10 @@ class TriggerEngine:
                 if value[2] == hold_index:
                     self._pending_press.pop(pidx, None)
 
+        for idx, (b, first) in list(self._double.items()):
+            if now - first > b.hold_ms / 1000.0:
+                self._double.pop(idx, None)
+
         for idx, (b, deadline) in list(self._hold.items()):
             if idx not in self._hold:
                 continue
@@ -346,12 +374,20 @@ class TriggerEngine:
                 continue
             self._hold.pop(idx, None)
             drop_pending(idx)
-            self._cancel_siblings(b)
+            self._cancel_siblings(b)  # also drops deferred clicks on this combo
             fired.append(b)
+
+        # Fired after holds so a matured hold cancels the first click instead
+        # of both actions running.
+        for key, (b, deadline) in list(self._deferred.items()):
+            if now >= deadline:
+                self._deferred.pop(key, None)
+                fired.append(b)
         return fired
 
     def next_deadline(self) -> float | None:
         values = [d for _, d in self._hold.values()]
+        values.extend(d for _, d in self._deferred.values())
         if self._leader:
             values.append(self._leader_deadline)
         if not values:
@@ -360,25 +396,59 @@ class TriggerEngine:
 
     def reset(self) -> None:
         self.pressed.clear()
+        self._down_at.clear()
         self._tap.clear()
         self._hold.clear()
         self._double.clear()
         self._pending_press.clear()
+        self._deferred.clear()
         self._armed.clear()
         self._clear_leader()
 
     def _by_index(self) -> dict[int, Binding]:
         return {b.index: b for b in self.bindings}
 
+    def _double_for(self, eligible: list[Binding], b: Binding) -> Binding | None:
+        return next((db for db in eligible
+                     if db.mods == b.mods and db.vks == b.vks
+                     and db.trigger == "double" and not db.seq), None)
+
+    def _defer(self, b: Binding, now: float, double: Binding) -> None:
+        key = (b.mods, b.vks)
+        deadline = now + double.hold_ms / 1000.0
+        old = self._deferred.get(key)
+        # If both press and tap share the combo, tap (which fires on release)
+        # is the more specific winner.
+        if old is not None and old[0].trigger == "tap" and b.trigger == "press":
+            return
+        self._deferred[key] = (b, deadline)
+
+    def _reset_vk(self, vk: int) -> None:
+        """Forget a button whose release event never arrived."""
+        self.pressed.discard(vk)
+        self._down_at.pop(vk, None)
+        self._cancel_vks({vk})
+        for idx in list(self._armed):
+            b = self._by_index().get(idx)
+            if b and vk in b.vks:
+                self._armed.discard(idx)
+
+    def _cancel_vks(self, vks: set[int]) -> None:
+        """Cancel every delayed trigger owned by any of these keys."""
+        for store in (self._tap, self._hold, self._double):
+            for idx, (b, _value) in list(store.items()):
+                if set(b.vks) & vks:
+                    store.pop(idx, None)
+        for idx, value in list(self._pending_press.items()):
+            if set(value[0].vks) & vks:
+                self._pending_press.pop(idx, None)
+        for key in list(self._deferred):
+            if set(key[1]) & vks:
+                self._deferred.pop(key, None)
+
     def _cancel_siblings(self, b: Binding) -> None:
         """Only one delayed trigger may own a physical combo at a time."""
-        for store in (self._tap, self._hold, self._double):
-            for idx, (other, _value) in list(store.items()):
-                if other.mods == b.mods and other.vks == b.vks:
-                    store.pop(idx, None)
-        for pidx, value in list(self._pending_press.items()):
-            if value[0].mods == b.mods and value[0].vks == b.vks:
-                self._pending_press.pop(pidx, None)
+        self._cancel_vks(set(b.vks))
 
 
 class KeyboardHook:

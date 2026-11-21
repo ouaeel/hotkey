@@ -1121,7 +1121,7 @@ class Editor:
         self.top.update_idletasks()
         win32.set_dark_titlebar(self.top.winfo_id(), self.pal["dark"])
         self._take_focus()
-        self._pause_app(True)
+        self._pause_app(True, capture=True)
         self._poll_job = self.top.after(100, self._poll_mouse)
         try:
             owner.root.wait_window(self.top)
@@ -1131,17 +1131,23 @@ class Editor:
     def t(self, text: str, **kwargs: object) -> str:
         return i18n.tr(text, self.lang, **kwargs)
 
-    def _pause_app(self, paused: bool) -> None:
+    def _pause_app(self, paused: bool, capture: bool = False) -> None:
         """Silence the tray app while a shortcut is being recorded.
 
         Otherwise pressing the buttons you are recording runs the old
-        hotkey (copy/paste, chords) inside this dialog.
+        hotkey (copy/paste, chords) inside this dialog.  Capture mode also
+        keeps the side buttons swallowed so they cannot act as Back/Forward.
         """
         pause = getattr(getattr(self.owner, "app", None), "pause_hotkeys", None)
         if pause is None:
             return
         try:
-            pause(paused)
+            pause(paused, capture=capture)
+        except TypeError:  # older App with the one-argument API
+            try:
+                pause(paused)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2064,6 +2070,22 @@ class Editor:
         """Watch the side buttons: Tk on Windows ignores XBUTTON messages."""
         self._poll_job = None
         try:
+            app = getattr(self.owner, "app", None)
+            events = getattr(app, "capture_events", None) if app else None
+            if events is not None:
+                while True:
+                    try:
+                        kind, vk, mods = events.get_nowait()
+                    except queue.Empty:
+                        break
+                    if (self._capture and not self._typing_mode
+                            and not self._seq_mode):
+                        if kind == "down":
+                            self._record(vk, mods)
+                        elif vk in self._held_keys:
+                            self._held_keys.remove(vk)
+                            if not self._held_keys:
+                                self._chord_done = False
             if self._capture and not self._typing_mode and not self._seq_mode:
                 mods = win32.current_mods()
                 for name in ("mouse4", "mouse5"):
@@ -2213,10 +2235,20 @@ class Editor:
                 self.err.configure(
                     text=f"{keys.format_many(mods, vks)} {detail}")
                 return
+            same_steps = True
+            if action == "macro":
+                # Two macros on one combo can be perfectly valid when they
+                # use different triggers or record different steps.
+                same_steps = (
+                    other.extra.get("steps") == extra.get("steps")
+                    and other.extra.get("speed", 1.0) == extra.get("speed", 1.0))
+            # Different triggers are allowed when the actions differ, but two
+            # entries doing the same thing on one button are still a mistake.
             if (same_combo and other.apps == apps
                     and config.profiles_overlap(other.profiles, profiles)
                     and other.action == action
-                    and other.value.strip() == value.strip()):
+                    and other.value.strip() == value.strip()
+                    and same_steps):
                 what = value.strip() if action == "keys" else action
                 detail = self.t(
                     "already does \"{what}\" ({label}) - same button, same action",

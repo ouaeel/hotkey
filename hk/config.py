@@ -439,8 +439,16 @@ def load(path: str) -> Config:
             )
         else:
             seen[norm] = entry.label()
+        macro_sig = ""
+        if entry.action == "macro":
+            # Macro bindings have an empty value; without the recorded steps
+            # two different macros on the same combo look like duplicates.
+            macro_sig = ":" + json.dumps(
+                [entry.extra.get("steps"), entry.extra.get("speed", 1.0)],
+                sort_keys=True, default=str)
         act = (f"{entry.mods}:{frozenset(entry.vks)}:{entry.seq}:{entry.trigger}:"
-               f"{entry.action}:{entry.value.strip()}:{entry.apps}:{profiles}")
+               f"{entry.action}:{entry.value.strip()}:{entry.apps}:{profiles}"
+               f"{macro_sig}")
         if act in seen_actions:
             cfg.warnings.append(
                 f"{entry.display} already does the same action "

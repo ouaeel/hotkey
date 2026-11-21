@@ -544,6 +544,117 @@ def _test_update_status() -> str:
     return "gear status events"
 
 
+def _test_audit_fixes() -> str:
+    """Regressions from the trigger/hook audit (single/double/chord/capture)."""
+    from . import app as appmod
+    from .hooks import Binding, TriggerEngine
+
+    m4 = keys.name_to_vk("mouse4")
+    m5 = keys.name_to_vk("mouse5")
+    ctrl = keys.MOD_CONTROL
+
+    def fire_all(eng, events):
+        out: list[int] = []
+        for when, kind, vk in events:
+            got = (eng.feed_down(vk, 0, when) if kind == "down"
+                   else eng.feed_up(vk, when))
+            out.extend(b.index for b in got)
+        return out
+
+    dbl_click = [(0.0, "down", m4), (0.05, "up", m4),
+                 (0.2, "down", m4), (0.25, "up", m4)]
+    single_click = [(0.0, "down", m4), (0.05, "up", m4)]
+
+    # 1) chord member with press + double: only the double action runs on a
+    #    double click, and the press action still runs on a single click.
+    shared = [Binding(0, 0, (m4,), "tap", 400),
+              Binding(1, 0, (m4, m5), "press", 400),
+              Binding(2, 0, (m4,), "double", 400)]
+    assert fire_all(TriggerEngine(shared), dbl_click) == [2]
+    eng = TriggerEngine(shared)
+    assert fire_all(eng, single_click) == []
+    assert [b.index for b in eng.due(0.45, 0, lambda v: False)] == [0]
+    plain = [Binding(0, 0, (m4,), "press", 400),
+             Binding(1, 0, (m4,), "double", 400)]
+    assert fire_all(TriggerEngine(plain), dbl_click) == [1]
+    eng = TriggerEngine(plain)
+    assert fire_all(eng, single_click) == []
+    assert [b.index for b in eng.due(0.45, 0, lambda v: False)] == [0]
+
+    # 2) a chord cancels its own buttons regardless of config row order.
+    parts = (Binding(0, 0, (m4,), "tap", 400),
+             Binding(1, 0, (m4, m5), "press", 400),
+             Binding(2, 0, (m5,), "hold", 400))
+    for order in ((0, 1, 2), (2, 1, 0), (1, 0, 2)):
+        eng = TriggerEngine([parts[i] for i in order])
+        got = fire_all(eng, [(0.0, "down", m4), (0.01, "down", m5),
+                             (0.02, "up", m5), (0.03, "up", m4)])
+        assert got == [1], (order, got)
+        assert eng.due(0.5, 0, lambda v: False) == []
+
+    # 3) a lost release no longer leaves a mouse button permanently dead.
+    eng = TriggerEngine([Binding(0, 0, (m5,), "hold", 400)])
+    eng.feed_down(m5, 0, 0.0)
+    assert eng.pressed == {m5}
+    eng.feed_down(m5, 0, 0.6)  # its up event never arrived
+    assert [b.index for b in eng.due(1.1, 0, lambda v: True)] == [0]
+    eng.feed_up(m5, 1.2)
+    assert eng.pressed == set()
+
+    # 4) a tap on a chord member fires however long it was held.
+    eng = TriggerEngine([Binding(0, 0, (m4,), "tap", 400)])
+    eng.feed_down(m4, 0, 0.0)
+    assert [b.index for b in eng.feed_up(m4, 41.0)] == [0]
+
+    # 5) the first button of a chord is swallowed; clicks never are.
+    fake = appmod.App.__new__(appmod.App)
+    fake.engine = TriggerEngine([Binding(0, 0, (m4, m5), "press")])
+    fake._swallowed = set()
+    assert fake._should_swallow("down", m4, 0) is True
+    assert fake._should_swallow("down", 0x01, 0) is False
+    assert fake._should_swallow("up", m4, 0) is True
+    assert fake._should_swallow("up", m4, 0) is False
+
+    # 6) a native hotkey that prefixes a chord goes through the hook.
+    prefix = config.Entry(keys="Ctrl+J", action="keys", value="x",
+                          mods=ctrl, vk=0x4A, vks=(0x4A,))
+    chord = config.Entry(keys="Ctrl+J+K", action="keys", value="y",
+                         mods=ctrl, vk=0x4A, vks=(0x4A, 0x4B))
+    plain_key = config.Entry(keys="Ctrl+T", action="keys", value="z",
+                             mods=ctrl, vk=0x54, vks=(0x54,))
+    combos = appmod.hooked_combos([prefix, chord, plain_key])
+    assert (ctrl, frozenset((0x4A,))) in combos
+    assert (ctrl, frozenset((0x54,))) not in combos
+
+    # 7) capture mode swallows side buttons and queues them for the editor.
+    fake = appmod.App.__new__(appmod.App)
+    fake._capture_paused = True
+    fake.capture_events = queue.Queue()
+    assert fake._hook_event("down", m4) is True
+    assert fake._hook_event("down", 0x01) is False  # left click must still work
+    assert fake._hook_event("down", 0x4A) is False
+    assert fake.capture_events.get_nowait()[1] == m4
+
+    # 8) different macros on one combo are not duplicates.
+    raw = {"version": 1, "settings": {}, "hotkeys": [
+        {"keys": "mouse4", "action": "macro", "trigger": "press",
+         "steps": [{"wait": 1}]},
+        {"keys": "mouse4", "action": "macro", "trigger": "hold",
+         "steps": [{"wait": 2}]},
+    ]}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "macros.json")
+        config.save_raw(path, raw)
+        cfg = config.load(path)
+        assert not cfg.warnings, cfg.warnings
+        raw["hotkeys"][1]["steps"] = [{"wait": 1}]
+        raw["hotkeys"][1]["trigger"] = "press"
+        config.save_raw(path, raw)
+        cfg = config.load(path)
+        assert cfg.warnings, "identical macros should warn"
+    return "double + chord + lost-up + capture + duplicate guards"
+
+
 def run(config_path: str, full: bool = False) -> int:
     print("Hotkey self-test")
     print(f"  python      {sys.version.split()[0]}")
@@ -557,6 +668,7 @@ def run(config_path: str, full: bool = False) -> int:
     results.check("icon generation", _test_icon)
     results.check("OS hotkey dispatch", _test_hotkey_dispatch)
     results.check("trigger engine (chord/tap/hold)", _test_engine)
+    results.check("trigger audit regressions", _test_audit_fixes)
     results.check("per-app scope", _test_app_scope)
     results.check("leader sequences", _test_sequence)
     results.check("profiles", _test_profiles)

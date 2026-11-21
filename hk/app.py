@@ -52,10 +52,9 @@ TRAY_UID = 1
 # left/right/middle click (which a chord like "Mouse5+MouseLeft" used to do)
 # leaves Windows with no click at all, which looks like a dead mouse.
 SWALLOWABLE_MOUSE = frozenset((0x05, 0x06))
-# A side button that is also part of a chord fires its own hotkey on
-# release, inside this window, so the chord can cancel it. Keep the window
-# generous: holding a side button for five seconds is not unusual.
-CHORD_TAP_MS = 30000
+# Buttons shared with a chord use "tap" instead of "press", so the chord can
+# cancel the single action before it runs.  A release always completes a tap,
+# however long it was held; no artificial multi-second window is needed.
 HOTKEY_BASE = 100
 ID_SUSPEND = 90
 
@@ -89,6 +88,35 @@ def data_dir() -> str:
         return fallback
 
 
+def chord_keys(entries) -> frozenset[int]:
+    """Every key/button that appears in a multi-key chord."""
+    return frozenset(vk for e in entries
+                     if e.enabled and len(e.vks) > 1 for vk in e.vks)
+
+
+def needs_hook(entry: config.Entry) -> bool:
+    """RegisterHotKey cannot express these features."""
+    return bool(entry.apps) or any(
+        keys.is_mouse_vk(vk) for vk in entry.vks
+    ) or len(entry.vks) > 1 or entry.trigger != "press" or bool(entry.seq)
+
+
+def hooked_combos(entries) -> frozenset[tuple[int, frozenset[int]]]:
+    """Combos that must be handled by the hook, never RegisterHotKey.
+
+    Besides the obvious hook features, every single-key prefix of a chord is
+    included: a native prefix would fire on key-down, then the chord would
+    fire again when the second key arrives.
+    """
+    combos = {(e.mods, frozenset(e.vks)) for e in entries
+              if e.enabled and needs_hook(e)}
+    for e in entries:
+        if e.enabled and len(e.vks) > 1:
+            for vk in e.vks:
+                combos.add((e.mods, frozenset((vk,))))
+    return frozenset(combos)
+
+
 class App:
     def __init__(self, config_path: str, use_tray: bool = True):
         self.path = os.path.abspath(config_path)
@@ -97,6 +125,7 @@ class App:
         self.cfg = config.Config(path=self.path)
         self.suspended = False
         self._paused = False
+        self._capture_paused = False
         self._registered: set[int] = set()
         self._by_id: dict[int, config.Entry] = {}
         self._failures: list[str] = []
@@ -118,6 +147,10 @@ class App:
         # Recent hotkey fires, drained by the settings window to flash its row.
         # Bounded so a closed window cannot accumulate events forever.
         self.fire_events: queue.Queue[int] = queue.Queue(maxsize=1)
+        # Side-button events seen while the editor records a shortcut.  The
+        # mouse hook stays installed in capture mode so the button's normal
+        # Back/Forward action is swallowed instead of firing behind the dialog.
+        self.capture_events: queue.Queue[tuple[str, int, int]] = queue.Queue(maxsize=8)
         # Update checks run in short-lived daemon threads and report back by
         # posting a message, keeping the main loop single-threaded.
         self._update_info: update.UpdateInfo | None = None
@@ -421,20 +454,8 @@ class App:
             old = preferred.get(key)
             if old is None or len(entry.profiles) > len(old.profiles):
                 preferred[key] = entry
-        chord_vks: set[int] = set()
-        for entry in entries:
-            if entry.enabled and len(entry.vks) > 1:
-                chord_vks.update(entry.vks)
-
-        def needs_hook(entry: config.Entry) -> bool:
-            return bool(entry.apps) or any(
-                keys.is_mouse_vk(vk) for vk in entry.vks
-            ) or len(entry.vks) > 1 or entry.trigger != "press" or bool(entry.seq)
-
-        hooked_combos = {
-            (e.mods, frozenset(e.vks)) for e in entries
-            if e.enabled and needs_hook(e)
-        }
+        chords = chord_keys(entries)
+        combos = hooked_combos(entries)
 
         for entry in entries:
             if not entry.enabled:
@@ -461,20 +482,20 @@ class App:
             # RegisterHotKey cannot filter by app, and a native hotkey would
             # swallow the combo everywhere.  Anything scoped therefore goes
             # through the hook, and so does a global entry sharing its combo.
-            shared = (entry.mods, frozenset(entry.vks)) in hooked_combos
+            shared = (entry.mods, frozenset(entry.vks)) in combos
             if needs_hook(entry) or shared:
                 try:
                     from .hooks import Binding
                     trigger = entry.trigger if len(entry.vks) == 1 else "press"
                     hold_ms = int(entry.extra.get(
                         "hold_ms", self.cfg.settings.get("hold_ms", 400)))
-                    if (mouse and len(entry.vks) == 1 and entry.vk in chord_vks
+                    if (len(entry.vks) == 1 and entry.vk in chords
                             and trigger == "press"):
-                        # This button also starts a chord: wait for the release
-                        # so the chord can cancel it instead of both actions
-                        # running on the same press.
+                        # This key/button also starts a chord: wait for the
+                        # release so the chord can cancel the single action.
+                        # The tap fires on every release, however long it was
+                        # held, so a normal hold_ms is now sufficient.
                         trigger = "tap"
-                        hold_ms = max(hold_ms, CHORD_TAP_MS)
                     binding = Binding(
                         index=entry.index, mods=entry.mods, vks=entry.vks,
                         trigger=trigger, hold_ms=hold_ms,
@@ -552,8 +573,37 @@ class App:
             except Exception:
                 pass
 
+    def _start_capture_hook(self) -> None:
+        """Keep side buttons eaten while a shortcut is being recorded.
+
+        Uninstalling the whole mouse hook here let the button's normal action
+        (browser Back/Forward) run behind the editor.  With no engine installed
+        no hotkey can fire; side-button events are simply queued for the editor
+        and swallowed.
+        """
+        from .hooks import MouseHook
+        if self.mouse_hook is not None:
+            return
+        try:
+            self.mouse_hook = MouseHook(self._hook_event)
+            if not self.mouse_hook.installed:
+                raise RuntimeError("SetWindowsHookEx failed")
+            log.info("mouse capture hook installed")
+        except Exception as exc:
+            log.error("mouse capture hook failed: %s", exc)
+            self.mouse_hook = None
+
     def _hook_event(self, kind: str, vk: int) -> bool:
         """Feed one key/mouse event; True means the event was consumed."""
+        if self._capture_paused:
+            if vk in SWALLOWABLE_MOUSE:
+                try:
+                    self.capture_events.put_nowait(
+                        (kind, vk, win32.current_mods()))
+                except queue.Full:
+                    pass
+                return True
+            return False
         if self.engine is None:
             self._swallowed.clear()
             return False
@@ -579,21 +629,20 @@ class App:
 
         Left/right/middle clicks always pass through, even when they are part
         of a chord: eating them while the app runs is indistinguishable from
-        a broken mouse.  A side button is eaten only when a binding really
-        uses it (on press, or when its chord is fully held), and its release
-        is eaten only if that press was eaten - an unmatched eaten release
-        would leave Windows stuck with the button down.
+        a broken mouse.  A side button is eaten from the first press whenever
+        a binding uses it, including as a chord member - otherwise the first
+        button of a chord leaks a browser Back/Forward.  Its release is eaten
+        only if that press was eaten, so Windows is never left with a button
+        stuck down.
         """
         if vk not in SWALLOWABLE_MOUSE:
             return False
         if kind == "down":
-            pressed = self.engine.pressed
             app = win32.foreground_app() if any(
                 b.apps for b in self.engine.bindings) else ""
             eat = any(
                 vk in b.vks and b.mods == mods
                 and (not b.apps or win32.app_matches(b.apps, app))
-                and (len(b.vks) == 1 or set(b.vks) <= pressed)
                 for b in self.engine.bindings)
             if eat:
                 self._swallowed.add(vk)
@@ -845,10 +894,14 @@ class App:
     def request_settings(self) -> None:
         win32.user32.PostMessageW(win32.HWND(self.hwnd), WM_SETTINGS, 0, 0)
 
-    def pause_hotkeys(self, paused: bool) -> None:
-        """Drop or restore every hotkey (used while one is recorded)."""
-        win32.user32.PostMessageW(win32.HWND(self.hwnd), WM_PAUSE,
-                                  1 if paused else 0, 0)
+    def pause_hotkeys(self, paused: bool, capture: bool = False) -> None:
+        """Drop or restore hotkeys while one is recorded.
+
+        ``capture`` keeps the mouse hook alive (but fires no hotkeys) so a
+        side button being recorded cannot trigger its normal Back/Forward.
+        """
+        mode = 2 if (paused and capture) else (1 if paused else 0)
+        win32.user32.PostMessageW(win32.HWND(self.hwnd), WM_PAUSE, mode, 0)
 
     def request_quit(self) -> None:
         win32.user32.PostMessageW(win32.HWND(self.hwnd), WM_QUIT_APP, 0, 0)
@@ -962,8 +1015,15 @@ class App:
                 self.open_settings()
                 return 0
             if msg == WM_PAUSE:
-                self._paused = bool(int(wparam))
-                self._register_all()
+                mode = int(wparam)
+                self._paused = mode != 0
+                self._capture_paused = mode == 2
+                if self._capture_paused:
+                    self._unregister_all()
+                    self._stop_hook()
+                    self._start_capture_hook()
+                else:
+                    self._register_all()
                 return 0
             if msg == WM_QUIT_APP or msg == win32.WM_CLOSE:
                 self.shutdown()
