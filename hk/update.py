@@ -39,6 +39,29 @@ def is_newer(candidate: str, current: str = __version__) -> bool:
     return new + (0,) * (size - len(new)) > old + (0,) * (size - len(old))
 
 
+def releases_page(url: str = DEFAULT_URL) -> str:
+    """Human-readable releases page for a configured API endpoint.
+
+    Update checks use the GitHub *API* URL, but opening that URL in a browser
+    shows raw JSON.  Convert it to the normal releases page instead.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    parts = [part for part in parsed.path.split("/") if part]
+    owner = repo = ""
+    if "repos" in parts:
+        index = parts.index("repos")
+        if len(parts) > index + 2:
+            owner, repo = parts[index + 1], parts[index + 2]
+    elif host.endswith("github.com") and len(parts) >= 2:
+        owner, repo = parts[0], parts[1]
+    if not owner or not repo:
+        return "https://github.com/ouaeel/hotkey/releases"
+    if host == "api.github.com":
+        host = "github.com"
+    return f"https://{host}/{owner}/{repo}/releases"
+
+
 def token_from(settings: dict | None = None) -> str:
     """Read an optional token from settings or from the configured env var."""
     settings = settings or {}

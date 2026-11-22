@@ -10,6 +10,7 @@ from . import i18n, keys, update
 
 DEFAULT_SETTINGS: dict = {
     "show_notifications": True,
+    "start_with_window": False,
     "notify_on_start": False,
     "reload_on_change": True,
     "typing_delay_ms": 2,

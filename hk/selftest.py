@@ -84,6 +84,109 @@ def _test_run_command() -> str:
     return "detached command"
 
 
+def _test_topmost_api() -> str:
+    """Pin/unpin uses HWND_TOPMOST and HWND_NOTOPMOST on the target window."""
+    state = {"ex": 0}
+    calls: list[str] = []
+    flags: list[int] = []
+
+    class FakeUser32:
+        def GetWindowLongW(self, hwnd, index):
+            assert index == win32.GWL_EXSTYLE
+            return state["ex"]
+
+        def SetWindowPos(self, hwnd, insert, x, y, width, height, options):
+            if insert is win32.HWND_TOPMOST:
+                calls.append("pin")
+                state["ex"] |= win32.WS_EX_TOPMOST
+            elif insert is win32.HWND_NOTOPMOST:
+                calls.append("unpin")
+                state["ex"] &= ~win32.WS_EX_TOPMOST
+            else:
+                calls.append("?")
+            flags.append(int(options))
+            return 1
+
+    old_user = win32.user32
+    win32.user32 = FakeUser32()
+    try:
+        assert not win32.is_topmost(99)
+        assert win32.set_topmost(99, True) is True
+        assert win32.is_topmost(99)
+        assert win32.set_topmost(99, False) is True
+        assert not win32.is_topmost(99)
+        assert win32.toggle_topmost(99) is True
+        assert win32.toggle_topmost(99) is False
+    finally:
+        win32.user32 = old_user
+    assert calls == ["pin", "unpin", "pin", "unpin"], calls
+    expected = win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE
+    assert all(flag == expected for flag in flags), flags
+    return "HWND_TOPMOST / HWND_NOTOPMOST + toggle"
+
+
+def _test_pin_action() -> str:
+    """The pin action targets the window active when the hotkey fires."""
+    old_foreground = win32.foreground
+    old_is_topmost = win32.is_topmost
+    old_set_topmost = win32.set_topmost
+    state = {"top": False, "foreground": 4242}
+    calls: list[tuple[int, bool]] = []
+
+    def fake_set(hwnd, on):
+        calls.append((int(hwnd), bool(on)))
+        state["top"] = bool(on)
+        return True
+
+    win32.foreground = lambda: state["foreground"]
+    win32.is_topmost = lambda hwnd: state["top"]
+    win32.set_topmost = fake_set
+    ctx = type("Ctx", (), {"settings": {}})()
+
+    def run(mode: str) -> str:
+        entry = config.Entry(keys="ctrl+alt+p", action="pin", value=mode)
+        return actions.run(entry, ctx)
+
+    try:
+        assert "pinned" in run("pin")
+        assert calls[-1] == (4242, True) and state["top"], calls
+        assert "unpinned" in run("unpin")
+        assert calls[-1] == (4242, False) and not state["top"], calls
+        assert "pinned" in run("toggle")
+        assert calls[-1] == (4242, True), calls
+        assert "unpinned" in run("toggle"), calls
+
+        for bad in ("floating",):
+            try:
+                run(bad)
+            except actions.ActionError:
+                pass
+            else:
+                raise AssertionError(f"unknown pin mode {bad!r} accepted")
+
+        state["foreground"] = None
+        try:
+            run("pin")
+        except actions.ActionError:
+            pass
+        else:
+            raise AssertionError("pin without an active window accepted")
+
+        state["foreground"] = 4242
+        win32.set_topmost = lambda hwnd, on: False
+        try:
+            run("pin")
+        except actions.ActionError:
+            pass
+        else:
+            raise AssertionError("refused pin was reported as success")
+    finally:
+        win32.foreground = old_foreground
+        win32.is_topmost = old_is_topmost
+        win32.set_topmost = old_set_topmost
+    return "pin / unpin / toggle on the active window"
+
+
 def _test_config() -> str:
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "hotkeys.json")
@@ -511,6 +614,14 @@ def _test_update() -> str:
     assert update.is_newer("v1.0.1", "1.0.0")
     assert not update.is_newer("1.0.0", "1.0.0")
     assert not update.is_newer("bad", "1.0.0")
+    assert update.releases_page(update.DEFAULT_URL) == (
+        "https://github.com/ouaeel/hotkey/releases")
+    assert update.releases_page(
+        "https://api.github.com/repos/fork/tool/releases/latest") == (
+            "https://github.com/fork/tool/releases")
+    assert update.releases_page(
+        "https://github.com/fork/tool/releases") == (
+            "https://github.com/fork/tool/releases")
     return "version compare + release parsing"
 
 
@@ -541,6 +652,7 @@ def _test_update_status() -> str:
     assert status["state"] == "blocked", status
     assert status["message"] == "Add a GitHub token to check this private repo"
     assert app.update_snapshot()["current"] == update.__version__
+    assert app._releases_url() == "https://github.com/ouaeel/hotkey/releases"
     return "gear status events"
 
 
@@ -655,6 +767,140 @@ def _test_audit_fixes() -> str:
     return "double + chord + lost-up + capture + duplicate guards"
 
 
+def _test_power_actions() -> str:
+    """Sleep/shutdown/restart scheduling is cancellable and never fires in tests."""
+    from . import app as appmod
+
+    calls: list[str] = []
+    old_suspend, old_shutdown, old_restart = (
+        win32.suspend_pc, win32.shutdown_pc, win32.restart_pc)
+    win32.suspend_pc = lambda: calls.append("sleep")
+    win32.shutdown_pc = lambda: calls.append("shutdown")
+    win32.restart_pc = lambda: calls.append("restart")
+    fake = None
+    try:
+        fake = appmod.App.__new__(appmod.App)
+        fake._power_lock = threading.Lock()
+        fake._power_timer = None
+        fake._power_action = ""
+        fake._power_deadline = 0.0
+        fake._power_generation = 0
+        fake.cfg = config.Config(path="")
+        fake.use_tray = False
+        fake.t = lambda text, **kw: text.format(**kw) if kw else text
+        fake.notify = lambda *a, **kw: None
+        fake._update_tray = lambda: None
+
+        fake.schedule_power_action("sleep", 0)
+        assert calls == ["sleep"], calls
+
+        fake.schedule_power_action("shutdown", 10)
+        status = fake.power_status()
+        assert status["active"] and status["action"] == "shutdown", status
+        assert 590 <= status["seconds_left"] <= 600, status
+        stale = fake._power_timer.args[1]
+        assert fake.cancel_power_action() is True
+        assert not fake.power_status()["active"]
+        fake._power_fired("shutdown", stale)  # raced callback must be ignored
+        assert calls == ["sleep"], "cancelled timer still ran"
+
+        fake.schedule_power_action("restart", 0)
+        assert calls == ["sleep", "restart"], calls
+
+        try:
+            fake.schedule_power_action("hibernate", 1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsupported power action was accepted")
+
+        entry = config.Entry(keys="ctrl+alt+f24", action="system",
+                             value="shutdown")
+        actions.run(entry, fake)
+        assert calls[-1] == "shutdown", calls
+    finally:
+        if fake is not None:
+            fake.cancel_power_action(notify=False)
+        win32.suspend_pc = old_suspend
+        win32.shutdown_pc = old_shutdown
+        win32.restart_pc = old_restart
+    return "timed sleep/shutdown/restart + cancel"
+
+
+def _test_suspend_power_api() -> str:
+    """Suspend uses S3 on old systems and display-off on Modern Standby."""
+    attempts: list[tuple[bool, bool, bool]] = []
+    privileged: list[bool] = []
+    locked: list[bool] = []
+    broadcast: list[tuple] = []
+
+    class FakePowerOk:
+        def SetSuspendState(self, hibernate, force, disable):
+            attempts.append((bool(hibernate), bool(force), bool(disable)))
+            return True
+
+    class FakePowerUnsupported:
+        def SetSuspendState(self, hibernate, force, disable):
+            attempts.append((bool(hibernate), bool(force), bool(disable)))
+            return False
+
+    class FakeUser32:
+        def LockWorkStation(self):
+            locked.append(True)
+
+        def SendMessageTimeoutW(self, hwnd, msg, wparam, lparam, flags,
+                                timeout, result):
+            broadcast.append((hwnd, msg, wparam, lparam, flags, timeout))
+            return 1
+
+    old_power = win32.powrprof
+    old_user = win32.user32
+    old_enable = win32._enable_shutdown_privilege
+    win32.user32 = FakeUser32()
+    win32._enable_shutdown_privilege = lambda: privileged.append(True)
+    try:
+        win32.powrprof = FakePowerOk()
+        win32.suspend_pc()
+        assert privileged, "suspend did not request the shutdown privilege"
+        assert attempts == [(False, True, False)], attempts
+        assert not locked and not broadcast
+
+        win32.powrprof = FakePowerUnsupported()
+        ctypes.set_last_error(50)  # ERROR_NOT_SUPPORTED
+        win32.suspend_pc()
+        assert locked, "modern-standby fallback did not lock the PC"
+        assert broadcast and broadcast[-1][1:4] == (0x0112, 0xF170, 2), broadcast
+    finally:
+        win32.powrprof = old_power
+        win32.user32 = old_user
+        win32._enable_shutdown_privilege = old_enable
+    return "S3 suspend + modern-standby display fallback"
+
+
+def _test_restart_api() -> str:
+    """Restart uses the Windows reboot flag and requests the privilege."""
+    calls: list[tuple[int, int]] = []
+    privileged: list[bool] = []
+
+    class FakeUser32:
+        def ExitWindowsEx(self, flags, reason):
+            calls.append((int(flags), int(reason)))
+            return True
+
+    old_user = win32.user32
+    old_enable = win32._enable_shutdown_privilege
+    win32.user32 = FakeUser32()
+    win32._enable_shutdown_privilege = lambda: privileged.append(True)
+    try:
+        win32.restart_pc()
+    finally:
+        win32.user32 = old_user
+        win32._enable_shutdown_privilege = old_enable
+    assert privileged, "restart did not request the shutdown privilege"
+    assert calls == [(win32.EWX_REBOOT | win32.EWX_FORCEIFHUNG, 0)], calls
+    return "EWX_REBOOT + privilege"
+
+
 def run(config_path: str, full: bool = False) -> int:
     print("Hotkey self-test")
     print(f"  python      {sys.version.split()[0]}")
@@ -663,6 +909,8 @@ def run(config_path: str, full: bool = False) -> int:
     results.check("hotkey parsing", _test_keys)
     results.check("text tokens", _test_tokens)
     results.check("run action", _test_run_command)
+    results.check("topmost window API", _test_topmost_api)
+    results.check("pin window action", _test_pin_action)
     results.check("config round-trip", _test_config)
     results.check("language settings", _test_language)
     results.check("icon generation", _test_icon)
@@ -673,6 +921,9 @@ def run(config_path: str, full: bool = False) -> int:
     results.check("leader sequences", _test_sequence)
     results.check("profiles", _test_profiles)
     results.check("macro control", _test_macro_control)
+    results.check("power schedule", _test_power_actions)
+    results.check("suspend power API", _test_suspend_power_api)
+    results.check("restart power API", _test_restart_api)
     results.check("validation + safe macro keys", _test_validation)
     results.check("update checker", _test_update)
     results.check("gear update status", _test_update_status)

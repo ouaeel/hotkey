@@ -58,6 +58,13 @@ SWALLOWABLE_MOUSE = frozenset((0x05, 0x06))
 HOTKEY_BASE = 100
 ID_SUSPEND = 90
 
+
+def _minutes_text(value: float) -> str:
+    """Short, locale-neutral minute count for notifications and the menu."""
+    rounded = round(float(value), 1)
+    return str(int(rounded)) if rounded.is_integer() else f"{rounded:g}"
+
+
 CMD_SETTINGS = 2000
 CMD_RELOAD = 2001
 CMD_CONFIG = 2002
@@ -68,6 +75,7 @@ CMD_QUIT = 2006
 CMD_MACRO = 2007
 CMD_UPDATE = 2008
 CMD_RELEASES = 2009
+CMD_POWER_CANCEL = 2010
 CMD_PROFILE_BASE = 3000
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -151,6 +159,13 @@ class App:
         # mouse hook stays installed in capture mode so the button's normal
         # Back/Forward action is swallowed instead of firing behind the dialog.
         self.capture_events: queue.Queue[tuple[str, int, int]] = queue.Queue(maxsize=8)
+        # One dormant daemon timer drives a scheduled sleep/shutdown.  It is
+        # cancellable from the gear window or tray menu and is cleared on quit.
+        self._power_lock = threading.Lock()
+        self._power_timer: threading.Timer | None = None
+        self._power_action = ""
+        self._power_deadline = 0.0
+        self._power_generation = 0
         # Update checks run in short-lived daemon threads and report back by
         # posting a message, keeping the main loop single-threaded.
         self._update_info: update.UpdateInfo | None = None
@@ -202,6 +217,9 @@ class App:
             self.notify(APP_NAME, self.t(
                 "{count} hotkeys active. Double-click the tray icon to edit them.",
                 count=self.active_count))
+        if self.cfg.settings.get("start_with_window"):
+            log.info("opening settings window on start")
+            self.open_settings()
         return self._loop()
 
     def _create_window(self) -> None:
@@ -256,6 +274,13 @@ class App:
     def _tooltip(self) -> str:
         state = (self.t("paused") if self.suspended
                  else self.t("{count} hotkeys active", count=self.active_count))
+        power = self.power_status()
+        if power["active"]:
+            action = power["action"]
+            label = self._power_label(action)
+            state += " · " + self.t(
+                "Power: {action} in {minutes} min", action=label,
+                minutes=_minutes_text(power["seconds_left"] / 60.0))
         return f"{APP_NAME} - {state}"
 
     # -- config --------------------------------------------------------------
@@ -856,12 +881,8 @@ class App:
                     self.t("Version {version} is available", version=info.version))
 
     def _releases_url(self) -> str:
-        if self._update_info is not None:
-            return self._update_info.url
-        base = str(self.cfg.settings.get("update_url") or update.DEFAULT_URL)
-        if base.rstrip("/").endswith("/releases/latest"):
-            return base.rstrip("/")[:-len("/releases/latest")] + "/releases"
-        return "https://github.com/ouaeel/hotkey/releases"
+        return update.releases_page(
+            str(self.cfg.settings.get("update_url") or update.DEFAULT_URL))
 
     def open_config(self) -> None:
         config.ensure_default(self.path)
@@ -875,6 +896,105 @@ class App:
             win32.open_target(target)
         except OSError as exc:
             self.notify(self.t("Cannot open"), str(exc), error=True)
+
+    # -- scheduled power actions ---------------------------------------------
+    @staticmethod
+    def _power_function(action: str):
+        """Resolve at call time so diagnostics can patch win32 functions."""
+        return {
+            "sleep": win32.suspend_pc,
+            "shutdown": win32.shutdown_pc,
+            "restart": win32.restart_pc,
+        }[action]
+
+    def _power_label(self, action: str) -> str:
+        return self.t({
+            "sleep": "Sleep", "shutdown": "Shutdown", "restart": "Restart",
+        }.get(str(action), "Shutdown"))
+
+    def schedule_power_action(self, action: str, minutes: float) -> None:
+        """Sleep, shut down or restart now, or after a cancellable delay."""
+        action = str(action or "").strip().lower()
+        if action not in ("sleep", "shutdown", "restart"):
+            raise ValueError(f"unsupported power action {action!r}")
+        try:
+            delay = float(minutes)
+        except (TypeError, ValueError):
+            raise ValueError("delay must be a number of minutes") from None
+        if delay < 0 or delay > 1440:
+            raise ValueError("delay must be between 0 and 1440 minutes")
+        self.cancel_power_action(notify=False)
+        label = self._power_label(action)
+
+        if delay <= 0:
+            log.info("power action now: %s", action)
+            self._power_function(action)()
+            return
+
+        with self._power_lock:
+            self._power_generation += 1
+            generation = self._power_generation
+            timer = threading.Timer(
+                delay * 60.0, self._power_fired, args=(action, generation))
+            timer.daemon = True
+            self._power_timer = timer
+            self._power_action = action
+            self._power_deadline = time.time() + delay * 60.0
+        timer.start()
+        log.info("power action scheduled: %s in %s min",
+                 action, _minutes_text(delay))
+        self.notify(
+            self.t("Power action"),
+            self.t("Power action scheduled: {action} in {minutes} min",
+                   action=label, minutes=_minutes_text(delay)),
+            force=True)
+        self._update_tray()
+
+    def cancel_power_action(self, notify: bool = True) -> bool:
+        """Cancel the pending power action, if any."""
+        with self._power_lock:
+            timer = self._power_timer
+            action = self._power_action
+            self._power_generation += 1
+            self._power_timer = None
+            self._power_action = ""
+            self._power_deadline = 0.0
+        if timer is None:
+            return False
+        timer.cancel()
+        log.info("power action cancelled: %s", action)
+        self._update_tray()
+        if notify:
+            self.notify(self.t("Power action"), self.t("Power action cancelled"))
+        return True
+
+    def power_status(self) -> dict:
+        """Snapshot for the gear window and tray menu."""
+        with self._power_lock:
+            active = self._power_timer is not None
+            action = self._power_action
+            deadline = self._power_deadline
+        return {
+            "active": active,
+            "action": action,
+            "seconds_left": max(0.0, deadline - time.time()),
+        }
+
+    def _power_fired(self, action: str, generation: int) -> None:
+        with self._power_lock:
+            if generation != self._power_generation:
+                log.debug("ignored stale power timer: %s", action)
+                return
+            self._power_timer = None
+            self._power_action = ""
+            self._power_deadline = 0.0
+        log.info("power timer fired: %s", action)
+        self._update_tray()
+        try:
+            self._power_function(action)()
+        except Exception as exc:
+            log.error("power action %s failed: %s", action, exc)
+            self.notify(self.t("Power action"), str(exc), error=True, force=True)
 
     # -- state toggles -------------------------------------------------------
     def toggle_suspend(self) -> None:
@@ -1094,6 +1214,8 @@ class App:
             self._check_updates(manual=True)
         elif cmd == CMD_RELEASES:
             self.open_path(self._releases_url())
+        elif cmd == CMD_POWER_CANCEL:
+            self.cancel_power_action()
         elif cmd == CMD_QUIT:
             self.request_quit()
         elif CMD_PROFILE_BASE <= cmd < CMD_PROFILE_BASE + 1000:
@@ -1160,8 +1282,18 @@ class App:
                     version=self._update_info.version)
              if self._update_info else self.t("Check for updates"),
              False, False),
-            (CMD_QUIT, self.t("Quit"), False, False),
         ]
+        power = self.power_status()
+        if power["active"]:
+            action = power["action"]
+            label = self._power_label(action)
+            extra.append((0, "---", False, False))
+            extra.append((
+                CMD_POWER_CANCEL,
+                self.t("Cancel {action} in {minutes} min", action=label,
+                       minutes=_minutes_text(power["seconds_left"] / 60.0)),
+                False, False))
+        extra.append((CMD_QUIT, self.t("Quit"), False, False))
         items += extra
         # menu_create_ex returns the root plus every submenu; all of them own
         # USER handles and must be destroyed, not just the root.
@@ -1204,6 +1336,7 @@ class App:
 
     def shutdown(self) -> None:
         log.info("shutting down")
+        self.cancel_power_action(notify=False)
         win32.user32.KillTimer(win32.HWND(self.hwnd), TIMER_WATCH)
         self.macro.cancel()
         if self._macro_panel is not None:

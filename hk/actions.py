@@ -31,7 +31,9 @@ MEDIA_OPS = {
 WINDOW_OPS = ["left", "right", "top", "bottom", "maximize", "minimize",
               "restore", "center", "topmost", "close"]
 
-SYSTEM_OPS = ["lock", "sleep", "screenshot", "recycle", "taskmanager"]
+PIN_OPS = ["toggle", "pin", "unpin"]
+
+SYSTEM_OPS = ["lock", "sleep", "shutdown", "screenshot", "recycle", "taskmanager"]
 
 APP_OPS = ["settings", "reload", "suspend", "config", "log", "quit"]
 
@@ -75,6 +77,10 @@ SPECS: dict[str, Spec] = {
     ),
     "media": Spec("Media / volume key", "Operation", options=tuple(MEDIA_OPS)),
     "window": Spec("Window control", "Operation", options=tuple(WINDOW_OPS)),
+    "pin": Spec(
+        "Pin window always on top", "Mode",
+        "Active window: toggle = pin/unpin, pin = always on, unpin = normal",
+        options=tuple(PIN_OPS)),
     "system": Spec("System command", "Operation", options=tuple(SYSTEM_OPS)),
     "app": Spec("Hotkey app command", "Operation", options=tuple(APP_OPS)),
     "summon": Spec(
@@ -248,6 +254,21 @@ def run(entry, ctx, prepare_only: bool = False) -> str:
             time.sleep(0.02)
         return f"media {value}"
 
+    if action == "pin":
+        hwnd = win32.foreground()
+        if not hwnd:
+            raise ActionError("no active window")
+        mode = (value or "toggle").strip().lower()
+        if mode not in PIN_OPS:
+            raise ActionError(f"unknown pin mode {value!r}")
+        if mode == "toggle":
+            on = not win32.is_topmost(hwnd)
+        else:
+            on = mode == "pin"
+        if not win32.set_topmost(hwnd, on):
+            raise ActionError("Windows refused to change the window's top-most state")
+        return "window pinned on top" if on else "window unpinned"
+
     if action == "window":
         hwnd = win32.foreground()
         if not hwnd:
@@ -267,6 +288,8 @@ def run(entry, ctx, prepare_only: bool = False) -> str:
             win32.lock_workstation()
         elif op == "sleep":
             win32.suspend_pc()
+        elif op == "shutdown":
+            win32.shutdown_pc()
         elif op == "screenshot":
             win32.open_target("ms-screenclip:")
         elif op == "recycle":

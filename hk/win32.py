@@ -6,6 +6,7 @@ response to a user action or a registered hotkey (no polling).
 from __future__ import annotations
 
 import ctypes
+import logging
 import math
 import os
 import random
@@ -15,6 +16,8 @@ from ctypes import (POINTER, WINFUNCTYPE, Structure, Union, byref, c_int,
 
 from . import keys as _keys
 
+log = logging.getLogger("hotkey")
+
 MOD_ALT = _keys.MOD_ALT
 MOD_CONTROL = _keys.MOD_CONTROL
 MOD_SHIFT = _keys.MOD_SHIFT
@@ -23,6 +26,7 @@ MOD_WIN = _keys.MOD_WIN
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 try:
     powrprof = ctypes.WinDLL("powrprof")
 except OSError:  # pragma: no cover - older / stripped systems
@@ -44,6 +48,26 @@ ULONG_PTR = ctypes.c_size_t
 LPCWSTR = c_wchar_p
 WNDPROC = WINFUNCTYPE(LRESULT, HWND, UINT, WPARAM, LPARAM)
 
+TOKEN_ADJUST_PRIVILEGES = 0x0020
+TOKEN_QUERY = 0x0008
+SE_PRIVILEGE_ENABLED = 0x00000002
+EWX_SHUTDOWN = 0x00000001
+EWX_REBOOT = 0x00000002
+EWX_FORCEIFHUNG = 0x00000010
+
+
+class LUID(Structure):
+    _fields_ = [("LowPart", DWORD), ("HighPart", c_int32)]
+
+
+class LUID_AND_ATTRIBUTES(Structure):
+    _fields_ = [("Luid", LUID), ("Attributes", DWORD)]
+
+
+class TOKEN_PRIVILEGES(Structure):
+    _fields_ = [("PrivilegeCount", DWORD),
+                ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
 # --- window messages / constants --------------------------------------------
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
@@ -52,6 +76,9 @@ WM_TIMER = 0x0113
 WM_NULL = 0x0000
 WM_HOTKEY = 0x0312
 WM_APP = 0x8000
+WM_SETICON = 0x0080
+ICON_SMALL = 0
+ICON_BIG = 1
 WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP = 0x0205
 WM_CONTEXTMENU = 0x007B
@@ -178,6 +205,9 @@ user32.PostMessageW.argtypes = [HWND, UINT, WPARAM, LPARAM]
 user32.PostMessageW.restype = ctypes.c_bool
 user32.SendMessageW.argtypes = [HWND, UINT, WPARAM, LPARAM]
 user32.SendMessageW.restype = LRESULT
+user32.SendMessageTimeoutW.argtypes = [
+    HWND, UINT, WPARAM, LPARAM, UINT, UINT, POINTER(ctypes.c_size_t)]
+user32.SendMessageTimeoutW.restype = LRESULT
 user32.SendInput.argtypes = [UINT, POINTER(INPUT), c_int]
 user32.SendInput.restype = UINT
 user32.SetForegroundWindow.argtypes = [HWND]
@@ -239,8 +269,20 @@ user32.PostQuitMessage.argtypes = [c_int]
 user32.CloseClipboard.argtypes = []
 user32.LockWorkStation.argtypes = []
 shell32.SHEmptyRecycleBinW.argtypes = [HWND, LPCWSTR, DWORD]
+kernel32.GetCurrentProcess.argtypes = []
+kernel32.GetCurrentProcess.restype = HANDLE
+advapi32.OpenProcessToken.argtypes = [HANDLE, DWORD, POINTER(HANDLE)]
+advapi32.OpenProcessToken.restype = ctypes.c_bool
+advapi32.LookupPrivilegeValueW.argtypes = [LPCWSTR, LPCWSTR, POINTER(LUID)]
+advapi32.LookupPrivilegeValueW.restype = ctypes.c_bool
+advapi32.AdjustTokenPrivileges.argtypes = [
+    HANDLE, ctypes.c_bool, POINTER(TOKEN_PRIVILEGES), DWORD, c_void_p, c_void_p]
+advapi32.AdjustTokenPrivileges.restype = ctypes.c_bool
+user32.ExitWindowsEx.argtypes = [UINT, DWORD]
+user32.ExitWindowsEx.restype = ctypes.c_bool
 if powrprof is not None:
     powrprof.SetSuspendState.argtypes = [ctypes.c_bool, ctypes.c_bool, ctypes.c_bool]
+    powrprof.SetSuspendState.restype = ctypes.c_bool
 user32.GetAsyncKeyState.argtypes = [c_int]
 user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.FindWindowW.argtypes = [LPCWSTR, LPCWSTR]
@@ -292,15 +334,26 @@ def move_window(hwnd: int, x: int, y: int, w: int, h: int) -> None:
     user32.MoveWindow(HWND(hwnd), x, y, w, h, True)
 
 
-def toggle_topmost(hwnd: int) -> bool:
+def is_topmost(hwnd: int) -> bool:
+    """True when Windows already keeps this window above normal windows."""
     ex = user32.GetWindowLongW(HWND(hwnd), GWL_EXSTYLE)
-    if ex & WS_EX_TOPMOST:
-        user32.SetWindowPos(HWND(hwnd), HWND_NOTOPMOST, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-        return False
-    user32.SetWindowPos(HWND(hwnd), HWND_TOPMOST, 0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-    return True
+    return bool(int(ex) & WS_EX_TOPMOST)
+
+
+def set_topmost(hwnd: int, on: bool) -> bool:
+    """Pin or unpin a window; returns True when the requested state was set."""
+    insert = HWND_TOPMOST if on else HWND_NOTOPMOST
+    ok = user32.SetWindowPos(HWND(hwnd), insert, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+    return bool(ok) and is_topmost(hwnd) == bool(on)
+
+
+def toggle_topmost(hwnd: int) -> bool:
+    """Flip the pin state; returns True when the window ended up pinned."""
+    desired = not is_topmost(hwnd)
+    if set_topmost(hwnd, desired):
+        return desired
+    return is_topmost(hwnd)
 
 
 # --- clipboard --------------------------------------------------------------
@@ -440,6 +493,20 @@ def load_icon(path: str | None) -> int:
     return int(user32.LoadIconW(None, c_void_p(32512)))  # IDI_APPLICATION
 
 
+def set_window_icon(hwnd: int, path: str) -> bool:
+    """Set a Tk window's native icon (title bar and taskbar button).
+
+    ``wm iconbitmap`` alone does not always produce a WM_SETICON handle on
+    Windows, so send it explicitly as well.
+    """
+    hicon = load_icon(path)
+    if not hicon:
+        return False
+    user32.SendMessageW(HWND(hwnd), WM_SETICON, ICON_SMALL, LPARAM(hicon))
+    user32.SendMessageW(HWND(hwnd), WM_SETICON, ICON_BIG, LPARAM(hicon))
+    return True
+
+
 def tray_add(hwnd: int, uid: int, icon: int, tip: str, callback_msg: int) -> bool:
     nid = NOTIFYICONDATAW()
     nid.cbSize = sizeof(NOTIFYICONDATAW)
@@ -554,9 +621,92 @@ def lock_workstation() -> None:
     user32.LockWorkStation()
 
 
+HWND_BROADCAST = 0xFFFF
+WM_SYSCOMMAND = 0x0112
+SC_MONITORPOWER = 0xF170
+SMTO_BLOCK = 0x0001
+SMTO_ABORTIFHUNG = 0x0002
+
+
+def _turn_display_off() -> None:
+    """Blank every display without waiting forever on a stuck window."""
+    result = ctypes.c_size_t(0)
+    user32.SendMessageTimeoutW(
+        HWND(HWND_BROADCAST), WM_SYSCOMMAND, SC_MONITORPOWER, 2,
+        SMTO_BLOCK | SMTO_ABORTIFHUNG, 2000, ctypes.byref(result))
+
+
+def _modern_standby_sleep() -> None:
+    """Trigger Modern Standby by locking and turning the display off.
+
+    Windows 8+ systems using S0 Low Power Idle reject SetSuspendState with
+    ERROR_NOT_SUPPORTED.  The supported fallback is the same transition the
+    power button/Start-menu Sleep item performs: blank the display, which lets
+    the power manager enter Modern Standby.
+    """
+    try:
+        lock_workstation()
+    except Exception:
+        pass
+    log.info("sleep: using modern-standby display-off fallback")
+    _turn_display_off()
+
+
 def suspend_pc() -> None:
-    if powrprof is not None:
-        powrprof.SetSuspendState(False, False, False)
+    if powrprof is None:  # pragma: no cover - stripped-down Windows
+        _modern_standby_sleep()
+        return
+    # Grant the shutdown privilege and force the transition for traditional
+    # S1-S3 systems.  Modern-standby laptops report ERROR_NOT_SUPPORTED here.
+    try:
+        _enable_shutdown_privilege()
+    except OSError:
+        pass
+    if powrprof.SetSuspendState(False, True, False):
+        return
+    error = ctypes.get_last_error()
+    _modern_standby_sleep()
+    if error not in (0, 50):  # keep a note for unusual failures
+        log.warning("SetSuspendState failed (%s); display-off fallback used", error)
+
+
+def _enable_shutdown_privilege() -> None:
+    """Grant this process the right to call ExitWindowsEx."""
+    token = HANDLE()
+    if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    luid = LUID()
+    try:
+        if not advapi32.LookupPrivilegeValueW(
+                None, "SeShutdownPrivilege", byref(luid)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        privileges = TOKEN_PRIVILEGES(
+            1, (LUID_AND_ATTRIBUTES * 1)(
+                LUID_AND_ATTRIBUTES(luid, SE_PRIVILEGE_ENABLED)))
+        ctypes.set_last_error(0)
+        ok = advapi32.AdjustTokenPrivileges(
+            token, False, byref(privileges), sizeof(privileges), None, None)
+        error = ctypes.get_last_error()
+        if not ok or error:
+            raise ctypes.WinError(error)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def shutdown_pc() -> None:
+    """Shut Windows down, forcing only apps that refuse to close."""
+    _enable_shutdown_privilege()
+    if not user32.ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCEIFHUNG, 0):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def restart_pc() -> None:
+    """Restart Windows, forcing only apps that refuse to close."""
+    _enable_shutdown_privilege()
+    if not user32.ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG, 0):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def empty_recycle_bin() -> int:

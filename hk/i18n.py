@@ -42,7 +42,49 @@ TEXT: dict[str, dict[str, str]] = {
         "Interface language": "Langue de l'interface",
         "Language settings": "Paramètres de langue",
         "Quick settings": "Paramètres rapides",
+        "SETTINGS": "PARAMÈTRES",
+        "Settings tools": "Outils de paramètres",
+        "Shortcuts & power": "Raccourcis et alimentation",
+        "Shortcuts": "Raccourcis",
+        "Power": "Alimentation",
+        "POWER": "ALIMENTATION",
+        "Power description":
+            "Planifiez la mise en veille ou l'arrêt. Une action en attente peut "
+            "être annulée ici ou depuis le menu de la barre des tâches.",
+        "Sleep": "Mise en veille",
+        "Shutdown": "Arrêt",
+        "Restart": "Redémarrer",
+        "Power timer": "Minuteur d'alimentation",
+        "Delay (minutes)": "Délai (minutes)",
+        "0 = now": "0 = maintenant",
+        "Enter minutes (0-1440).": "Saisissez des minutes (0-1440).",
+        "Confirm shutdown": "Confirmer l'arrêt",
+        "Shut down this PC in {minutes} min?":
+            "Arrêter cet ordinateur dans {minutes} min ?",
+        "Confirm restart": "Confirmer le redémarrage",
+        "Restart this PC in {minutes} min?":
+            "Redémarrer cet ordinateur dans {minutes} min ?",
+        "Schedule": "Planifier",
+        "Cancel power action": "Annuler l'action d'alimentation",
+        "Power action": "Action d'alimentation",
+        "Power action failed: {error}":
+            "Échec de l'action d'alimentation : {error}",
+        "Power action scheduled: {action} in {minutes} min":
+            "Action d'alimentation planifiée : {action} dans {minutes} min",
+        "Power action cancelled": "Action d'alimentation annulée",
+        "No power action scheduled": "Aucune action d'alimentation planifiée",
+        "Scheduled: {action} in {minutes} min":
+            "Planifié : {action} dans {minutes} min",
+        "Scheduled: {action} in {seconds} s":
+            "Planifié : {action} dans {seconds} s",
+        "Power: {action} in {minutes} min":
+            "Alimentation : {action} dans {minutes} min",
+        "Cancel {action} in {minutes} min":
+            "Annuler {action} dans {minutes} min",
         "Show notifications": "Afficher les notifications",
+        "Start with window": "Ouvrir la fenêtre au démarrage",
+        "Start with window enabled": "La fenêtre s'ouvrira au démarrage",
+        "Start with window disabled": "La fenêtre ne s'ouvrira plus au démarrage",
         "Current version:": "Version actuelle :",
         "New version:": "Nouvelle version :",
         "Check version": "Vérifier la version",
@@ -185,6 +227,11 @@ TEXT: dict[str, dict[str, str]] = {
         "Media / volume key": "Touche média / volume",
         "Operation": "Opération",
         "Window control": "Contrôle de fenêtre",
+        "Pin window always on top": "Épingler la fenêtre au premier plan",
+        "Pin": "Épingler",
+        "Mode": "Mode",
+        "Active window: toggle = pin/unpin, pin = always on, unpin = normal":
+            "Fenêtre active : bascule, épingler ou désépingler",
         "System command": "Commande système",
         "Hotkey app command": "Commande de l'application Hotkey",
         "Summon / toggle a window": "Appeler / basculer une fenêtre",
@@ -316,7 +363,48 @@ TEXT: dict[str, dict[str, str]] = {
         "Interface language": "لغة الواجهة",
         "Language settings": "إعدادات اللغة",
         "Quick settings": "إعدادات سريعة",
+        "SETTINGS": "الإعدادات",
+        "Settings tools": "أدوات الإعدادات",
+        "Shortcuts & power": "الاختصارات والطاقة",
+        "Shortcuts": "الاختصارات",
+        "Power": "الطاقة",
+        "POWER": "الطاقة",
+        "Power description":
+            "جدولة السكون أو إيقاف التشغيل. يمكن إلغاء الإجراء المعلّق من هنا "
+            "أو من قائمة شريط المهام.",
+        "Sleep": "السكون",
+        "Shutdown": "إيقاف التشغيل",
+        "Restart": "إعادة التشغيل",
+        "Power timer": "مؤقت الطاقة",
+        "Delay (minutes)": "التأخير (بالدقائق)",
+        "0 = now": "0 = الآن",
+        "Enter minutes (0-1440).": "أدخل عدد الدقائق (0-1440).",
+        "Confirm shutdown": "تأكيد إيقاف التشغيل",
+        "Shut down this PC in {minutes} min?":
+            "إيقاف تشغيل هذا الجهاز بعد {minutes} دقيقة؟",
+        "Confirm restart": "تأكيد إعادة التشغيل",
+        "Restart this PC in {minutes} min?":
+            "إعادة تشغيل هذا الجهاز بعد {minutes} دقيقة؟",
+        "Schedule": "جدولة",
+        "Cancel power action": "إلغاء إجراء الطاقة",
+        "Power action": "إجراء الطاقة",
+        "Power action failed: {error}": "فشل إجراء الطاقة: {error}",
+        "Power action scheduled: {action} in {minutes} min":
+            "تم جدولة إجراء الطاقة: {action} بعد {minutes} دقيقة",
+        "Power action cancelled": "تم إلغاء إجراء الطاقة",
+        "No power action scheduled": "لا يوجد إجراء طاقة مجدول",
+        "Scheduled: {action} in {minutes} min":
+            "مجدول: {action} بعد {minutes} دقيقة",
+        "Scheduled: {action} in {seconds} s":
+            "مجدول: {action} بعد {seconds} ثانية",
+        "Power: {action} in {minutes} min":
+            "الطاقة: {action} بعد {minutes} دقيقة",
+        "Cancel {action} in {minutes} min":
+            "إلغاء {action} بعد {minutes} دقيقة",
         "Show notifications": "إظهار الإشعارات",
+        "Start with window": "فتح النافذة عند بدء التشغيل",
+        "Start with window enabled": "ستفتح النافذة عند بدء التشغيل",
+        "Start with window disabled": "لن تفتح النافذة عند بدء التشغيل",
         "Current version:": "الإصدار الحالي:",
         "New version:": "الإصدار الجديد:",
         "Check version": "التحقق من الإصدار",
@@ -459,6 +547,11 @@ TEXT: dict[str, dict[str, str]] = {
         "Media / volume key": "مفتاح وسائط / صوت",
         "Operation": "العملية",
         "Window control": "التحكم بالنوافذ",
+        "Pin window always on top": "تثبيت النافذة في المقدمة",
+        "Pin": "تثبيت",
+        "Mode": "الوضع",
+        "Active window: toggle = pin/unpin, pin = always on, unpin = normal":
+            "النافذة النشطة: تبديل أو تثبيت أو إلغاء التثبيت",
         "System command": "أمر النظام",
         "Hotkey app command": "أمر تطبيق Hotkey",
         "Summon / toggle a window": "استحضار نافذة أو التبديل إليها",

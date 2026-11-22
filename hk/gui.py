@@ -16,7 +16,7 @@ from .actions import SPECS
 
 FONT = "Segoe UI"
 MONO = "Consolas"
-FONT_BOOST = 1.2
+FONT_BOOST = 1.3
 
 
 def _font(size: int, *style: str) -> tuple:
@@ -62,6 +62,25 @@ def _pad(lang: str, before: int, after: int = 0) -> tuple[int, int]:
 def _columns(lang: str) -> tuple[int, int]:
     """Label column and value column for a two-column RTL-aware form."""
     return (1, 0) if i18n.is_rtl(lang) else (0, 1)
+
+
+def _apply_window_icon(win) -> None:
+    """Put the generated icon on any Tk window (title bar and taskbar).
+
+    Toplevel dialogs do not inherit the main window's icon on Windows, so
+    every form calls this explicitly.  A missing/broken icon must never stop
+    the UI from opening.
+    """
+    try:
+        from .app import data_dir
+        active, _ = icon.ensure_icon(data_dir())
+        win.iconbitmap(active)
+        try:
+            win32.set_window_icon(int(win.winfo_id()), active)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def _translate_widgets(widget, t) -> None:
@@ -226,6 +245,8 @@ class SettingsWindow:
         self.pending_settings: dict[str, object] = {}
         self._fire_job: str | None = None
         self._flash_jobs: dict[str, tuple[str, tuple[str, ...]]] = {}
+        self._countdown: dict | None = None
+        self._countdown_job: str | None = None
         self.pal = _palette()
         self.scale = _scale_factor()
         self.root = tk.Tk()
@@ -235,13 +256,21 @@ class SettingsWindow:
         return i18n.tr(text, self.lang, **kwargs)
 
     def _rebuild(self) -> None:
-        job = getattr(self, "_status_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except tk.TclError:
-                pass
-        self._status_job = None
+        # A Toplevel is also a child of root, so take the tiny timer down before
+        # the widget tree is replaced, then bring it back with the new language.
+        pending = None
+        if self._countdown is not None:
+            pending = (str(self._countdown.get("kind", "")),
+                       float(self._countdown.get("delay", 0) or 0))
+        self._close_countdown(restore=False)
+        for attr in ("_status_job", "_power_job", "_page_job"):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except (tk.TclError, ValueError):
+                    pass
+            setattr(self, attr, None)
         for job, _previous in self._flash_jobs.values():
             try:
                 self.root.after_cancel(job)
@@ -249,10 +278,17 @@ class SettingsWindow:
                 pass
         self._flash_jobs.clear()
         self._close_language_window()
+        self._power_var = None
+        self._power_cancel_btn = None
+        self._page_overlay = None
+        self._page_anim = False
         for child in list(self.root.winfo_children()):
             child.destroy()
         self._build()
         _translate_widgets(self.root, self.t)
+        if pending is not None:
+            self.root.withdraw()
+            self._show_countdown(*pending)
 
     def _notifications_enabled(self) -> bool:
         return bool(self.settings.get("show_notifications", True))
@@ -297,13 +333,14 @@ class SettingsWindow:
                             language=i18n.display(code)))
 
     def _close_language_window(self) -> None:
-        """Destroy the small language window if it is open."""
-        job = getattr(self, "_lang_win_update_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except (tk.TclError, ValueError):
-                pass
+        """Destroy the small quick-settings window if it is open."""
+        for attr in ("_lang_win_update_job",):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except (tk.TclError, ValueError):
+                    pass
         win = getattr(self, "_lang_win", None)
         if win is not None:
             try:
@@ -381,6 +418,203 @@ class SettingsWindow:
             pass
         self._lang_win_update_job = self.root.after(300, self._poll_update)
 
+    def _power_snapshot(self) -> dict:
+        snapshot = getattr(self.app, "power_status", None)
+        if callable(snapshot):
+            try:
+                return snapshot()
+            except Exception:
+                pass
+        return {"active": False, "action": "", "seconds_left": 0.0}
+
+    @staticmethod
+    def _power_label(action: object) -> str:
+        return {
+            "sleep": "Sleep", "shutdown": "Shutdown", "restart": "Restart",
+        }.get(str(action), "Shutdown")
+
+    def _power_text(self, status: dict) -> str:
+        if not status.get("active"):
+            return self.t("No power action scheduled")
+        action = status.get("action")
+        label = self.t(self._power_label(action))
+        left = max(0.0, float(status.get("seconds_left") or 0))
+        if left >= 60:
+            return self.t("Scheduled: {action} in {minutes} min",
+                          action=label, minutes=max(1, round(left / 60)))
+        return self.t("Scheduled: {action} in {seconds} s",
+                      action=label, seconds=max(1, int(left)))
+
+    def _update_power_status(self) -> None:
+        status = self._power_snapshot()
+        text = self._power_text(status)
+        variable = getattr(self, "_power_var", None)
+        if variable is not None:
+            variable.set(text)
+        hero = getattr(self, "_power_hero_var", None)
+        if hero is not None:
+            hero.set(text)
+        button = getattr(self, "_power_cancel_btn", None)
+        if button is not None:
+            try:
+                button.configure(
+                    state="normal" if status.get("active") else "disabled")
+            except tk.TclError:
+                pass
+
+    def _refresh_power_status(self) -> None:
+        page = getattr(self, "page_power", None)
+        if page is None:
+            return
+        try:
+            if not page.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self._update_power_status()
+        self._power_job = self.root.after(1000, self._refresh_power_status)
+
+    def _close_countdown(self, *, restore: bool = True) -> None:
+        """Tear down the tiny timer; optionally bring the settings window back."""
+        job = getattr(self, "_countdown_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
+        self._countdown_job = None
+        state = getattr(self, "_countdown", None)
+        self._countdown = None
+        if state is not None:
+            try:
+                win = state.get("win")
+                if win is not None and win.winfo_exists():
+                    win.destroy()
+            except tk.TclError:
+                pass
+        if restore:
+            try:
+                if self.root.winfo_exists() and not self.root.winfo_ismapped():
+                    self.root.deiconify()
+                    self.root.lift()
+            except tk.TclError:
+                pass
+
+    def _cancel_countdown(self) -> None:
+        """Cancel the scheduled action from the timer's Cancel/close button."""
+        canceller = getattr(self.app, "cancel_power_action", None)
+        if callable(canceller):
+            try:
+                canceller()
+            except Exception:
+                pass
+        self._close_countdown(restore=True)
+        self._update_power_status()
+
+    @staticmethod
+    def _countdown_text(seconds: float) -> str:
+        total = max(0, int(seconds + 0.999))
+        minutes_left, secs = divmod(total, 60)
+        return f"{minutes_left:02d}:{secs:02d}"
+
+    def _show_countdown(self, action: str, minutes: float) -> None:
+        """Replace the settings window with a tiny always-on-top countdown."""
+        self._close_countdown(restore=False)
+        p = self.pal
+        near = _near(self.lang)
+        just = _justify(self.lang)
+        delay = max(0.0, float(minutes))
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.title(self.t("Power timer"))
+        win.resizable(False, False)
+        win.configure(bg=p["bg"])
+        try:
+            win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        _apply_window_icon(win)
+
+        frame = tk.Frame(win, bg=p["panel"], highlightbackground=p["border"],
+                         highlightthickness=1,
+                         padx=int(18 * self.scale), pady=int(14 * self.scale))
+        frame.pack(fill="both", expand=True, padx=1, pady=1)
+        tk.Label(frame, text=self.t("Power timer"), font=_font(9, "bold"),
+                 bg=p["panel"], fg=p["muted"], anchor=near,
+                 justify=just).pack(fill="x")
+        action_lbl = tk.Label(
+            frame, text=self.t(self._power_label(action)),
+            font=_font(12, "bold"), bg=p["panel"], fg=p["accent"],
+            anchor=near, justify=just)
+        action_lbl.pack(fill="x", pady=(int(6 * self.scale), 0))
+        time_lbl = tk.Label(frame, text=self._countdown_text(delay * 60),
+                            font=_mono(30), bg=p["panel"], fg=p["fg"])
+        time_lbl.pack(fill="x", pady=(int(8 * self.scale),
+                                     int(10 * self.scale)))
+        cancel = tk.Button(
+            frame, text=self.t("Cancel"), command=self._cancel_countdown,
+            bg=p["panel2"], fg=p["fg"], activebackground=p["hover"],
+            activeforeground=p["fg"], relief="flat", bd=0,
+            font=_font(10, "bold"), padx=int(16 * self.scale),
+            pady=int(6 * self.scale), cursor="hand2")
+        cancel.pack(fill="x")
+        win.protocol("WM_DELETE_WINDOW", self._cancel_countdown)
+
+        self._countdown = {
+            "win": win, "time": time_lbl, "action": action_lbl,
+            "cancel": cancel, "kind": str(action), "delay": delay,
+            "started": time.monotonic(),
+        }
+        win.update_idletasks()
+        width = win.winfo_width() or int(230 * self.scale)
+        height = win.winfo_height() or int(170 * self.scale)
+        screen_w, screen_h = win.winfo_screenwidth(), win.winfo_screenheight()
+        x = 24 if self.rtl else max(0, screen_w - width - 24)
+        y = max(0, screen_h - height - 56)
+        win.geometry(f"+{x}+{y}")
+        win.deiconify()
+        win.lift()
+        win.focus_set()
+        self._tick_countdown()
+
+    def _tick_countdown(self) -> None:
+        """Refresh the tiny timer once a second and watch for cancellation."""
+        state = getattr(self, "_countdown", None)
+        if state is None:
+            return
+        job = getattr(self, "_countdown_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
+        self._countdown_job = None
+        status = self._power_snapshot()
+        if not status.get("active"):
+            elapsed = time.monotonic() - float(state.get("started", 0))
+            if elapsed >= max(0.0, float(state.get("delay", 0)) - 0.75):
+                # Timer fired (or the PC is going away): end the settings
+                # window too, so the tray can open a fresh one afterwards.
+                self._close_countdown(restore=False)
+                self._close()
+                return
+            self._close_countdown(restore=True)
+            self._update_power_status()
+            return
+        left = float(status.get("seconds_left") or 0)
+        if left <= 0:
+            left = max(0.0, float(state.get("delay", 0)) * 60.0 -
+                       (time.monotonic() - float(state.get("started", 0))))
+        label = state.get("time")
+        try:
+            text = self._countdown_text(left)
+            if str(label.cget("text")) != text:
+                label.configure(text=text)
+        except tk.TclError:
+            self._close_countdown(restore=False)
+            return
+        self._countdown_job = self.root.after(1000, self._tick_countdown)
+
     def _show_language_window(self) -> None:
         """Open the gear window with language and notification settings."""
         existing = getattr(self, "_lang_win", None)
@@ -403,12 +637,7 @@ class SettingsWindow:
         win.transient(self.root)
         win.resizable(False, False)
         win.configure(bg=p["bg"])
-        try:
-            from .app import data_dir
-            active, _ = icon.ensure_icon(data_dir())
-            win.iconbitmap(active)
-        except Exception:
-            pass
+        _apply_window_icon(win)
         try:
             win32.set_dark_titlebar(win.winfo_id(), p["dark"])
         except Exception:
@@ -436,6 +665,29 @@ class SettingsWindow:
             variable=notify_var, justify=just)
         self._lang_win_notify.pack(side=start)
         self._lang_win_notify_var = notify_var
+
+        start_row = ttk.Frame(body)
+        start_row.pack(fill="x", pady=(8, 0))
+        start_var = tk.BooleanVar(
+            master=win,
+            value=bool(self.settings.get("start_with_window", False)))
+        self._lang_win_start = ttk.Checkbutton(
+            start_row, text=self.t("Start with window"),
+            variable=start_var, justify=just)
+        self._lang_win_start.pack(side=start)
+        self._lang_win_start_var = start_var
+
+        auto_row = ttk.Frame(body)
+        auto_row.pack(fill="x", pady=(8, 0))
+        autostart_var = tk.BooleanVar(
+            master=win, value=bool(self.app.autostart_enabled()))
+        self._lang_win_autostart = ttk.Checkbutton(
+            auto_row, text=self.t("Start with Windows"),
+            variable=autostart_var, justify=just)
+        self._lang_win_autostart.pack(side=start)
+        self._lang_win_autostart_var = autostart_var
+        _tip(self._lang_win_autostart, self.status_var,
+             self.t("Run this app automatically when you sign in"))
 
         current_row = ttk.Frame(body)
         current_row.pack(fill="x", pady=(PAD_L, 0))
@@ -490,16 +742,31 @@ class SettingsWindow:
         def apply() -> None:
             code = i18n.code_from_display(combo.get(), self.lang)
             enabled = bool(notify_var.get())
+            start_window = bool(start_var.get())
+            autostart = bool(autostart_var.get())
+            auto_changed = autostart != bool(self.app.autostart_enabled())
             changes: dict[str, object] = {}
             if code != self.lang:
                 changes["language"] = code
             if enabled != self._notifications_enabled():
                 changes["show_notifications"] = enabled
-            if not changes:
+            if start_window != bool(self.settings.get("start_with_window", False)):
+                changes["start_with_window"] = start_window
+            if not changes and not auto_changed:
                 close()
                 return
-            if not self._apply_preference_changes(changes):
+            if changes and not self._apply_preference_changes(changes):
                 return
+            if auto_changed:
+                try:
+                    self.app.set_autostart(autostart)
+                except OSError as exc:
+                    autostart_var.set(self.app.autostart_enabled())
+                    messagebox.showerror(
+                        self.t("Hotkey"),
+                        self.t("Could not update autostart:\n{error}", error=exc),
+                        parent=self.root)
+                    return
             close()
             if "language" in changes:
                 self.lang = code
@@ -513,6 +780,14 @@ class SettingsWindow:
                 messages.append(
                     self.t("Notifications enabled") if enabled
                     else self.t("Notifications disabled"))
+            if "start_with_window" in changes:
+                messages.append(
+                    self.t("Start with window enabled") if start_window
+                    else self.t("Start with window disabled"))
+            if auto_changed:
+                messages.append(
+                    self.t("Autostart enabled") if autostart
+                    else self.t("Autostart disabled"))
             self._status(" · ".join(messages))
 
         ttk.Separator(body, orient="horizontal").pack(
@@ -541,6 +816,272 @@ class SettingsWindow:
         win.lift()
         combo.focus_set()
 
+    def _build_power_page(self, parent) -> None:
+        """Build the dedicated Power page inside the main settings window."""
+        start = _start(self.lang)
+        just = _justify(self.lang)
+        near = _near(self.lang)
+        job = getattr(self, "_power_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
+        self._power_job = None
+
+        ttk.Label(parent, text=self.t("POWER"), style="Section.TLabel",
+                  justify=just).pack(anchor=near, padx=PAD_L, pady=(12, 2))
+        ttk.Label(parent, text=self.t("Power description"),
+                  style="Sub.TLabel", justify=just,
+                  wraplength=int(620 * self.scale)).pack(
+                      anchor=near, padx=PAD_L, pady=(0, 12))
+
+        card = self._card(parent, side="x", padx=PAD_L,
+                          pady=(0, PAD_L), padding=(20, 18))
+
+        hero = ttk.Frame(card, style="Hero.TFrame", padding=(16, 14))
+        hero.pack(fill="x", pady=(0, 16))
+        self._power_hero_var = tk.StringVar(master=card, value="")
+        ttk.Label(hero, textvariable=self._power_hero_var,
+                  style="Hero.TLabel", justify=just,
+                  wraplength=int(520 * self.scale)).pack(
+                      fill="x", anchor=near)
+
+        action_row = ttk.Frame(card, style="Card.TFrame")
+        action_row.pack(fill="x")
+        ttk.Label(action_row, text=self.t("Action"),
+                  style="CardMuted.TLabel", justify=just).pack(side=start)
+        power_action = ttk.Combobox(
+            action_row, state="readonly", width=18,
+            values=[self.t("Sleep"), self.t("Shutdown"), self.t("Restart")])
+        power_action.current(0)
+        power_action.pack(side=start, padx=_pad(self.lang, 10))
+        self._power_action_combo = power_action
+
+        delay_row = ttk.Frame(card, style="Card.TFrame")
+        delay_row.pack(fill="x", pady=(10, 0))
+        ttk.Label(delay_row, text=self.t("Delay (minutes)"),
+                  style="CardMuted.TLabel", justify=just).pack(side=start)
+        delay_var = tk.StringVar(master=card, value="10")
+        self._power_delay_var = delay_var
+        ttk.Spinbox(delay_row, from_=0, to=1440, increment=1, width=10,
+                    textvariable=delay_var).pack(
+                        side=start, padx=_pad(self.lang, 10))
+        ttk.Label(delay_row, text=self.t("0 = now"),
+                  style="CardMuted.TLabel", justify=just).pack(side=start)
+
+        status_var = tk.StringVar(master=card, value="")
+        self._power_var = status_var
+
+        def plan_power() -> None:
+            actions = ("sleep", "shutdown", "restart")
+            index = power_action.current()
+            action = actions[index] if 0 <= index < len(actions) else "sleep"
+            raw = delay_var.get().strip()
+            try:
+                delay = float(raw)
+            except ValueError:
+                status_var.set(self.t("Enter minutes (0-1440)."))
+                return
+            if delay < 0 or delay > 1440:
+                status_var.set(self.t("Enter minutes (0-1440)."))
+                return
+            shown = str(int(delay)) if delay.is_integer() else f"{delay:g}"
+            if action in ("shutdown", "restart"):
+                confirmed = messagebox.askyesno(
+                    self.t("Confirm shutdown" if action == "shutdown"
+                           else "Confirm restart"),
+                    self.t("Shut down this PC in {minutes} min?"
+                           if action == "shutdown"
+                           else "Restart this PC in {minutes} min?",
+                           minutes=shown), parent=self.root)
+                if not confirmed:
+                    return
+            scheduler = getattr(self.app, "schedule_power_action", None)
+            if not callable(scheduler):
+                return
+            try:
+                scheduler(action, delay)
+            except Exception as exc:
+                status_var.set(
+                    self.t("Power action failed: {error}", error=exc))
+                self._update_power_status()
+                return
+            self._update_power_status()
+            if delay > 0:
+                self.root.withdraw()
+                self._show_countdown(action, delay)
+
+        def cancel_power() -> None:
+            canceller = getattr(self.app, "cancel_power_action", None)
+            if callable(canceller):
+                try:
+                    canceller()
+                except Exception as exc:
+                    status_var.set(
+                        self.t("Power action failed: {error}", error=exc))
+            self._close_countdown(restore=True)
+            self._update_power_status()
+
+        buttons = ttk.Frame(card, style="Card.TFrame")
+        buttons.pack(fill="x", pady=(12, 0))
+        ttk.Button(buttons, text=self.t("Schedule"),
+                   style="Accent.TButton", command=plan_power).pack(side=start)
+        self._power_cancel_btn = ttk.Button(
+            buttons, text=self.t("Cancel power action"),
+            style="Danger.TButton", command=cancel_power, state="disabled")
+        self._power_cancel_btn.pack(side=start, padx=_pad(self.lang, 8, 0))
+        ttk.Label(card, textvariable=status_var, style="CardMuted.TLabel",
+                  justify=just, wraplength=int(620 * self.scale)).pack(
+                      fill="x", anchor=near, pady=(10, 0))
+        self._update_power_status()
+        self._power_job = self.root.after(1000, self._refresh_power_status)
+
+    def _card(self, parent, *, side: str = "x", padx=None, pady=None,
+              padding=None, expand: bool = False) -> ttk.Frame:
+        """A card with a hairline border, for a more finished look."""
+        wrap = tk.Frame(parent, bg=self.pal["border"], bd=0)
+        wrap.pack(fill=side, expand=expand, padx=padx, pady=pady)
+        card = ttk.Frame(wrap, style="Card.TFrame",
+                         padding=padding or (PAD_L, PAD_L))
+        card.pack(fill="both", expand=True, padx=1, pady=1)
+        return card
+
+    def _update_nav_styles(self) -> None:
+        for entry in getattr(self, "_nav_rows", {}).values():
+            try:
+                entry["paint"]()
+            except (tk.TclError, KeyError):
+                pass
+
+    def _stop_page_animation(self) -> None:
+        job = getattr(self, "_page_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
+        self._page_job = None
+        overlay = getattr(self, "_page_overlay", None)
+        if overlay is not None:
+            try:
+                overlay.destroy()
+            except tk.TclError:
+                pass
+        self._page_overlay = None
+        if not getattr(self, "_page_anim", False):
+            return
+        for page in getattr(self, "_pages", {}).values():
+            try:
+                page.place_forget()
+            except tk.TclError:
+                pass
+        page = getattr(self, "_pages", {}).get(
+            getattr(self, "_active_page", "shortcuts"))
+        if page is not None:
+            try:
+                page.grid(row=0, column=0, sticky="nsew")
+            except tk.TclError:
+                pass
+        self._page_anim = False
+
+    def _show_page(self, name: str, animate: bool = True,
+                   force: bool = False) -> None:
+        pages = getattr(self, "_pages", {})
+        if name not in pages:
+            return
+        previous = getattr(self, "_active_page", "shortcuts")
+        if name == previous and not force:
+            self._update_nav_styles()
+            return
+        self._stop_page_animation()
+        self._active_page = name
+        self._update_nav_styles()
+        if animate and previous in pages and previous != name:
+            self._animate_page_switch(previous, name)
+            return
+        for key, page in pages.items():
+            try:
+                if key == name:
+                    page.grid(row=0, column=0, sticky="nsew")
+                    page.tkraise()
+                else:
+                    page.grid_remove()
+            except tk.TclError:
+                pass
+
+    def _animate_page_switch(self, old_name: str, new_name: str) -> None:
+        """Short cross-fade + slide, built only from stdlib Tk primitives."""
+        pages = getattr(self, "_pages", {})
+        old, new = pages[old_name], pages[new_name]
+        order = ("shortcuts", "power")
+        forward = order.index(new_name) > order.index(old_name)
+        direction = (1 if forward else -1) * (-1 if self.rtl else 1)
+        distance = max(8, int(18 * self.scale))
+        fades = ("", "gray12", "gray25", "gray50", "gray75")
+        reveal_fades = tuple(reversed(fades))
+        self._page_anim = True
+
+        old.grid_forget()
+        new.grid_forget()
+        old.place(x=0, y=0, relwidth=1, relheight=1)
+        new.place(x=direction * distance, y=0, relwidth=1, relheight=1)
+        new.tkraise()
+
+        overlay = tk.Canvas(self.page_host, highlightthickness=0, bd=0,
+                            bg=self.pal["bg"])
+        rect = overlay.create_rectangle(0, 0, 4, 4, fill=self.pal["bg"],
+                                        stipple="")
+        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.page_host.tk.call("raise", str(overlay))
+        self._page_overlay = overlay
+
+        def resize(_event=None) -> None:
+            try:
+                overlay.coords(rect, 0, 0,
+                               max(1, overlay.winfo_width()),
+                               max(1, overlay.winfo_height()))
+            except tk.TclError:
+                pass
+
+        overlay.bind("<Configure>", resize)
+        resize()
+
+        def fade_out(step: int) -> None:
+            if not self._page_anim:
+                return
+            if step >= len(fades):
+                old.place_forget()
+                reveal(0)
+                return
+            progress = step / (len(fades) - 1)
+            overlay.itemconfigure(rect, stipple=fades[step])
+            old.place(x=int(-direction * distance * progress), y=0,
+                      relwidth=1, relheight=1)
+            self._page_job = self.root.after(18, lambda: fade_out(step + 1))
+
+        def reveal(step: int) -> None:
+            if not self._page_anim:
+                return
+            if step >= len(reveal_fades):
+                try:
+                    overlay.destroy()
+                except tk.TclError:
+                    pass
+                self._page_overlay = None
+                new.place_forget()
+                new.grid(row=0, column=0, sticky="nsew")
+                self._page_anim = False
+                self._page_job = None
+                return
+            progress = step / (len(reveal_fades) - 1)
+            overlay.itemconfigure(rect, stipple=reveal_fades[step])
+            new.place(x=int(direction * distance * (1 - progress)), y=0,
+                      relwidth=1, relheight=1)
+            self._page_job = self.root.after(18, lambda: reveal(step + 1))
+
+        fade_out(0)
+
     def _apply_style(self) -> None:
         p = self.pal
         try:
@@ -553,21 +1094,53 @@ class SettingsWindow:
         s.configure(".", background=p["bg"], foreground=p["fg"], font=body,
                     focuscolor=p["accent"])
         s.configure("TFrame", background=p["bg"])
+        s.configure("TSeparator", background=p["border"])
         s.configure("Card.TFrame", background=p["panel"])
         s.configure("TLabel", background=p["bg"], foreground=p["fg"])
         s.configure("Card.TLabel", background=p["panel"], foreground=p["fg"],
-                    font=_font(9))
-        s.configure("Muted.TLabel", foreground=p["muted"], font=_font(9))
-        s.configure("Warning.TLabel", foreground=p["error"], font=_font(9, "bold"))
-        s.configure("Title.TLabel", font=_font(20, "bold"))
-        s.configure("Section.TLabel", foreground=p["muted"], font=_font(9, "bold"))
-        s.configure("Sub.TLabel", foreground=p["muted"], font=_font(10))
+                    font=_font(10))
+        s.configure("Muted.TLabel", foreground=p["muted"], font=_font(10))
+        s.configure("CardMuted.TLabel", background=p["panel"],
+                    foreground=p["muted"], font=_font(10))
+        s.configure("Warning.TLabel", foreground=p["error"], font=_font(10, "bold"))
+        s.configure("Title.TLabel", font=_font(22, "bold"))
+        s.configure("Brand.TLabel", font=_symbol_font(22),
+                    foreground=p["accent"], background=p["bg"])
+        s.configure("Section.TLabel", foreground=p["muted"], font=_font(10, "bold"))
+        s.configure("Sub.TLabel", foreground=p["muted"], font=_font(11))
+        s.configure("Badge.TLabel", background=p["panel2"], foreground=p["muted"],
+                    font=_font(9), padding=(10, 5))
+        s.configure("Sidebar.TFrame", background=p["panel"])
+        s.configure("SidebarHeading.TLabel", background=p["panel"],
+                    foreground=p["muted"], font=_font(10, "bold"))
+        s.configure("SidebarFoot.TLabel", background=p["panel"],
+                    foreground=p["muted"], font=_font(9))
+        s.configure("Hero.TFrame", background=p["panel2"])
+        s.configure("Hero.TLabel", background=p["panel2"], foreground=p["fg"],
+                    font=_font(13, "bold"))
+        s.configure("Sidebar.TButton", background=p["panel"],
+                    foreground=p["muted"], borderwidth=0,
+                    bordercolor=p["panel"], lightcolor=p["panel"],
+                    darkcolor=p["panel"], relief="flat",
+                    anchor=_near(self.lang),
+                    padding=(16, 12), font=_font(11, "bold"))
+        s.configure("SidebarActive.TButton", background=p["sel"],
+                    foreground=p["accent"], borderwidth=0,
+                    bordercolor=p["sel"], lightcolor=p["sel"],
+                    darkcolor=p["sel"], relief="flat",
+                    anchor=_near(self.lang),
+                    padding=(16, 12), font=_font(11, "bold"))
+        s.map("Sidebar.TButton", background=[("active", p["hover"])],
+              foreground=[("active", p["fg"])])
+        s.map("SidebarActive.TButton", background=[("active", p["hover"])],
+              foreground=[("active", p["accent_hover"])])
         s.configure("TButton", background=p["panel2"], foreground=p["fg"],
-                    borderwidth=0, padding=(12, 7), focusthickness=2)
-        s.configure("Icon.TButton", font=_symbol_font(11), padding=(8, 7))
+                    borderwidth=0, padding=(16, 10), focusthickness=2,
+                    font=_font(10))
+        s.configure("Icon.TButton", font=_symbol_font(12), padding=(10, 9))
         s.map("TButton", background=[("active", p["hover"]), ("disabled", p["panel2"])])
         s.configure("Accent.TButton", background=p["accent"], foreground=p["accent_fg"],
-                    borderwidth=0, padding=(14, 7), font=_font(10, "bold"))
+                    borderwidth=0, padding=(20, 11), font=_font(11, "bold"))
         s.map("Accent.TButton", background=[("active", p["accent_hover"]),
                                             ("disabled", p["panel2"])],
               foreground=[("disabled", p["muted"])])
@@ -576,20 +1149,30 @@ class SettingsWindow:
         s.configure("Treeview", background=p["panel"], fieldbackground=p["panel"],
                     foreground=p["fg"], borderwidth=0, relief="flat",
                     bordercolor=p["panel"], lightcolor=p["panel"],
-                    darkcolor=p["panel"], rowheight=int(34 * self.scale))
+                    darkcolor=p["panel"], rowheight=int(40 * self.scale))
         s.configure("Treeview.Heading", background=p["panel"], foreground=p["muted"],
-                    relief="flat", borderwidth=0, font=_font(9, "bold"),
-                    padding=(6, 8))
+                    relief="flat", borderwidth=0, font=_font(10, "bold"),
+                    padding=(8, 10))
         s.map("Treeview.Heading", background=[("active", p["panel"])])
         s.map("Treeview", background=[("selected", p["sel"])],
               foreground=[("selected", p["fg"])])
         s.configure("TEntry", fieldbackground=p["panel2"], foreground=p["fg"],
-                    insertcolor=p["fg"], borderwidth=1, padding=7,
+                    insertcolor=p["fg"], borderwidth=1, padding=9,
                     bordercolor=p["border"], lightcolor=p["panel2"],
                     darkcolor=p["panel2"], focuscolor=p["accent"])
+        s.configure("TSpinbox", fieldbackground=p["panel2"],
+                    background=p["panel2"], foreground=p["fg"],
+                    arrowcolor=p["muted"], borderwidth=1, padding=8,
+                    bordercolor=p["border"], lightcolor=p["panel2"],
+                    darkcolor=p["panel2"], focuscolor=p["accent"])
+        s.map("TSpinbox",
+              fieldbackground=[("readonly", p["panel2"])],
+              background=[("active", p["hover"])],
+              foreground=[("disabled", p["muted"])],
+              arrowcolor=[("active", p["accent"])])
         s.configure("TCombobox", fieldbackground=p["panel2"], background=p["panel2"],
                     foreground=p["fg"], arrowcolor=p["muted"], borderwidth=1,
-                    padding=6, bordercolor=p["border"], lightcolor=p["panel2"],
+                    padding=8, bordercolor=p["border"], lightcolor=p["panel2"],
                     darkcolor=p["panel2"], focuscolor=p["accent"])
         s.map("TCombobox", fieldbackground=[("readonly", p["panel2"])],
               background=[("readonly", p["panel2"]), ("active", p["panel2"])],
@@ -619,12 +1202,7 @@ class SettingsWindow:
         r.configure(bg=p["bg"])
         r.protocol("WM_DELETE_WINDOW", self._close)
         r.minsize(int(720 * self.scale), int(480 * self.scale))
-        try:
-            from .app import data_dir
-            active, _ = icon.ensure_icon(data_dir())
-            r.iconbitmap(active)
-        except Exception:
-            pass
+        _apply_window_icon(r)
         screen_w, screen_h = r.winfo_screenwidth(), r.winfo_screenheight()
         w = min(int(1020 * self.scale), max(int(720 * self.scale), screen_w - 24))
         h = min(int(660 * self.scale), max(int(480 * self.scale), screen_h - 24))
@@ -639,11 +1217,19 @@ class SettingsWindow:
         start, end = _start(self.lang), _end(self.lang)
         near = _near(self.lang)
         just = _justify(self.lang)
-        header = ttk.Frame(r, padding=(PAD_L, 18, PAD_L, 8))
+        header = ttk.Frame(r, padding=(PAD_L, 14, PAD_L, 10))
         header.pack(fill="x")
-        ttk.Label(header, text="Hotkey", style="Title.TLabel").pack(side=start)
-        self.count_lbl = ttk.Label(header, text="", style="Sub.TLabel")
-        self.count_lbl.pack(side=start, padx=_pad(self.lang, 12), pady=(8, 0))
+        title_box = ttk.Frame(header)
+        title_box.pack(side=start)
+        title_text = ttk.Frame(title_box)
+        title_text.pack(side=start)
+        self.title_lbl = ttk.Label(
+            title_text, text="Hotkey", style="Title.TLabel")
+        self.title_lbl.pack(anchor=near)
+        ttk.Label(title_text, text=self.t("Shortcuts & power"),
+                  style="Sub.TLabel").pack(anchor=near)
+        self.count_lbl = ttk.Label(header, text="", style="Badge.TLabel")
+        self.count_lbl.pack(side=start, padx=_pad(self.lang, 18, 0))
         header_actions = ttk.Frame(header)
         header_actions.pack(side=end)
         self.btn_reload = ttk.Button(header_actions, text="Reload",
@@ -667,19 +1253,98 @@ class SettingsWindow:
         _tip(self.btn_reload, self.status_var,
              self.t("Reload from disk (discards unsaved UI state)"))
 
-        self.banner = ttk.Frame(r, padding=(PAD_L, 0, PAD_L, 6))
+        self._active_page = getattr(self, "_active_page", "shortcuts")
+        self._sidebar_visible = True
+        self._page_job = None
+        self._page_overlay = None
+        self._page_anim = False
+        self._nav_buttons = {}
+        self._nav_rows = {}
+
+        ttk.Separator(r, orient="horizontal").pack(fill="x")
+
+        main = ttk.Frame(r)
+        main.pack(fill="both", expand=True)
+        self.page_host = ttk.Frame(main)
+        self.page_host.pack(side=end, fill="both", expand=True)
+        self.sidebar = ttk.Frame(
+            main, style="Sidebar.TFrame",
+            width=int(216 * self.scale), padding=(12, 16))
+        self.sidebar.pack(side=start, fill="y", before=self.page_host)
+        self.sidebar.pack_propagate(False)
+        ttk.Label(self.sidebar, text=self.t("Settings tools"),
+                  style="SidebarHeading.TLabel", anchor=near,
+                  justify=just).pack(fill="x", padx=_pad(self.lang, 8, 0),
+                                     pady=(0, 14))
+        for name, label, glyph in (
+                ("shortcuts", "Shortcuts", "⌨"),
+                ("power", "Power", "⏻")):
+            row = tk.Frame(self.sidebar, bg=p["panel"], cursor="hand2")
+            row.pack(fill="x", pady=(0, 6))
+            bar = tk.Frame(row, bg=p["panel"], width=4)
+            bar.pack(side=_start(self.lang), fill="y")
+            icon = tk.Label(row, text=glyph, font=_symbol_font(13),
+                            bg=p["panel"], fg=p["muted"], width=2)
+            icon.pack(side=start, padx=_pad(self.lang, 12, 0), pady=11)
+            text = tk.Label(row, text=self.t(label), font=_font(11, "bold"),
+                            bg=p["panel"], fg=p["muted"], anchor=near)
+            text.pack(side=start, fill="x", expand=True,
+                      padx=_pad(self.lang, 10, 10), pady=11)
+            entry = {"row": row, "icon": icon, "text": text, "bar": bar,
+                     "label": label}
+            self._nav_rows[name] = entry
+
+            def paint(_hover: bool = False, _name=name, _entry=entry) -> None:
+                active = _name == getattr(self, "_active_page", "shortcuts")
+                bg = (p["hover"] if _hover else
+                      p["sel"] if active else p["panel"])
+                fg = p["accent"] if active else p["fg"]
+                _entry["row"].configure(bg=bg)
+                _entry["icon"].configure(bg=bg, fg=fg)
+                _entry["text"].configure(bg=bg, fg=fg)
+                _entry["bar"].configure(bg=p["accent"] if active else bg)
+
+            entry["paint"] = paint
+            row.invoke = lambda _name=name: self._show_page(_name)
+            for widget in (row, icon, text):
+                widget.bind(
+                    "<Button-1>",
+                    lambda _e, _name=name: self._show_page(_name))
+                widget.bind(
+                    "<Enter>", lambda _e, _paint=paint: _paint(True))
+                widget.bind(
+                    "<Leave>", lambda _e, _paint=paint: _paint(False))
+        ttk.Label(self.sidebar, text=f"v{__version__}",
+                  style="SidebarFoot.TLabel").place(
+                      relx=0.0 if not self.rtl else 1.0, rely=1.0,
+                      x=10 if not self.rtl else -10, y=-8,
+                      anchor="nw" if not self.rtl else "ne")
+
+        self.page_host.columnconfigure(0, weight=1)
+        self.page_host.rowconfigure(0, weight=1)
+        self.page_shortcuts = ttk.Frame(self.page_host)
+        self.page_power = ttk.Frame(self.page_host)
+        self._pages = {
+            "shortcuts": self.page_shortcuts,
+            "power": self.page_power,
+        }
+
+        self.banner = ttk.Frame(self.page_shortcuts,
+                                padding=(PAD_L, 0, PAD_L, 6))
         self.banner_lbl = ttk.Label(self.banner, style="Warning.TLabel",
                                     justify=just)
         self.banner_lbl.pack(side=start)
         ttk.Button(self.banner, text="Open file", padding=(8, 3),
                    command=self.app.open_config).pack(side=end)
 
-        self._after_banner = ttk.Separator(r, orient="horizontal")
+        self._after_banner = ttk.Separator(self.page_shortcuts,
+                                           orient="horizontal")
         self._after_banner.pack(fill="x", padx=PAD_L)
-        ttk.Label(r, text="SHORTCUTS", style="Section.TLabel").pack(
-            anchor=near, padx=PAD_L, pady=(8, 2))
+        ttk.Label(self.page_shortcuts, text="SHORTCUTS",
+                  style="Section.TLabel").pack(
+                      anchor=near, padx=PAD_L, pady=(8, 2))
 
-        bar = ttk.Frame(r, padding=(PAD_L, 4, PAD_L, 10))
+        bar = ttk.Frame(self.page_shortcuts, padding=(PAD_L, 4, PAD_L, 10))
         bar.pack(fill="x")
         bar_actions = ttk.Frame(bar)
         bar_actions.pack(side=start)
@@ -709,8 +1374,9 @@ class SettingsWindow:
         self.cmb_profile.bind("<<ComboboxSelected>>",
                              lambda _e: self._switch_profile())
 
-        card = ttk.Frame(r, style="Card.TFrame", padding=PAD)
-        card.pack(fill="both", expand=True, padx=PAD_L)
+        card = self._card(self.page_shortcuts, side="both", padx=PAD_L,
+                          pady=(0, PAD_L), padding=(PAD + 4, PAD + 4),
+                          expand=True)
         tree_col, scroll_col = (1, 0) if self.rtl else (0, 1)
         card.columnconfigure(tree_col, weight=1)
         card.columnconfigure(scroll_col, weight=0)
@@ -763,16 +1429,11 @@ class SettingsWindow:
         self.tree.bind("<Return>", lambda _e: self._edit_selected())
         self.tree.bind("<Delete>", lambda _e: self._delete_selected())
 
+        self._build_power_page(self.page_power)
+        self._show_page(self._active_page, animate=False, force=True)
+
         foot = ttk.Frame(r, padding=(PAD_L, 10, PAD_L, 14))
         foot.pack(fill="x")
-        self.var_autostart = tk.BooleanVar(
-            master=self.root, value=self.app.autostart_enabled())
-        chk = ttk.Checkbutton(foot, text="Start with Windows", variable=self.var_autostart,
-                              command=self._toggle_autostart,
-                              justify=just)
-        chk.pack(side=start)
-        _tip(chk, self.status_var, self.t("Run this app automatically when you sign in"))
-
         foot_end = ttk.Frame(foot)
         foot_end.pack(side=end)
         self.status = ttk.Label(foot_end, textvariable=self.status_var,
@@ -1039,29 +1700,26 @@ class SettingsWindow:
         if self._save(self.t("Deleted {name}", name=entry.display)):
             self._select_row(next_index)
 
-    def _toggle_autostart(self) -> None:
-        try:
-            self.app.set_autostart(self.var_autostart.get())
-            self._status(self.t("Autostart enabled") if self.var_autostart.get()
-                         else self.t("Autostart disabled"))
-        except OSError as exc:
-            self.var_autostart.set(self.app.autostart_enabled())
-            messagebox.showerror(
-                self.t("Hotkey"),
-                self.t("Could not update autostart:\n{error}", error=exc),
-                parent=self.root)
-
     def _close(self) -> None:
-        if self._fire_job is not None:
-            try:
-                self.root.after_cancel(self._fire_job)
-            except tk.TclError:
-                pass
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self._close_countdown(restore=False)
+        for attr in ("_fire_job", "_status_job", "_power_job", "_page_job"):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except (tk.TclError, ValueError):
+                    pass
         for job, _previous in self._flash_jobs.values():
             try:
                 self.root.after_cancel(job)
             except tk.TclError:
                 pass
+        self._close_language_window()
         self.root.destroy()
 
     def run(self) -> None:
@@ -1106,11 +1764,13 @@ class Editor:
         self._rec_poll_job = None
         self._poll_job = None
         self._scroll_job = None
+        self._focus_job = None
 
         self.top = tk.Toplevel(owner.root)
         self.top.withdraw()
         self.top.title(self.t("Edit hotkey" if entry else "New hotkey"))
         self.top.configure(bg=self.pal["bg"])
+        _apply_window_icon(self.top)
         self.top.transient(owner.root)
         self.top.resizable(False, True)
         self._build()
@@ -1206,7 +1866,8 @@ class Editor:
 
     def _stop_jobs(self) -> None:
         """Cancel pending Tk callbacks before the dialog is destroyed."""
-        for name in ("_poll_job", "_scroll_job", "_rec_poll_job", "_detect_job"):
+        for name in ("_poll_job", "_scroll_job", "_rec_poll_job", "_detect_job",
+                     "_focus_job"):
             job = getattr(self, name, None)
             if job is None:
                 continue
@@ -1248,9 +1909,10 @@ class Editor:
             self.ent_keys.focus_set()
         except tk.TclError:
             return
-        self.top.after(180, self._settle_focus)
+        self._focus_job = self.top.after(180, self._settle_focus)
 
     def _settle_focus(self) -> None:
+        self._focus_job = None
         try:
             self.top.attributes("-topmost", False)
             self.top.focus_force()
@@ -2278,7 +2940,7 @@ def _short_action(action: str, lang: str = "en") -> str:
     label = {
         "open": "Open", "run": "Run", "type": "Type", "keys": "Keys",
         "clip": "Copy", "paste": "Paste", "media": "Media",
-        "window": "Window", "system": "System", "app": "App",
+        "window": "Window", "pin": "Pin", "system": "System", "app": "App",
         "summon": "Summon", "macro": "Macro", "profile": "Profile",
     }.get(action, action)
     return i18n.tr(label, lang)
@@ -2406,12 +3068,7 @@ class _MacroPanel:
         root = tk.Tk()
         root.withdraw()
         root.title(self.t("Hotkey · Macro control"))
-        try:
-            from .app import data_dir
-            active, _paused = icon.ensure_icon(data_dir())
-            root.iconbitmap(active)
-        except Exception:
-            pass
+        _apply_window_icon(root)
         pal, scale = self._apply_style(root)
         root.configure(bg=pal["bg"])
         root.resizable(False, False)

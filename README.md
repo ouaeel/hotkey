@@ -22,7 +22,7 @@ inside the Win32 message loop until you press a key.
 ## Quick start
 
 1. Double-click **`Hotkey.pyw`** (or `run.bat`).
-2. A mint lightning icon appears in the system tray.
+2. A mint power-and-keyboard icon appears in the system tray.
 3. Press one of the starter hotkeys:
 
 | Shortcut | What happens |
@@ -125,6 +125,7 @@ app is running is enough if `reload_on_change` is `true` (default).
 | Key | Meaning |
 |---|---|
 | `show_notifications` | Tray balloons for reloads and errors |
+| `start_with_window` | Open the settings window when the app starts (default `false`) |
 | `notify_on_start` | Balloon when the app starts |
 | `reload_on_change` | Watch `hotkeys.json` and apply edits automatically |
 | `language` | Interface language: `en`, `fr` or `ar` (default `en`) |
@@ -138,14 +139,33 @@ app is running is enough if `reload_on_change` is `true` (default).
 | `update_token` | Optional GitHub token; leave empty and use an env var instead |
 | `update_token_env` | Environment variable holding a token (default `GITHUB_TOKEN`) |
 
-The settings window's top header has a ⚙ button to the right of
-**Open hotkeys.json**. It opens a small **Quick settings** window containing the
-language selector (English, Français and العربية), a **Show notifications**
-on/off switch, and the update panel: **Current version**, **New version**,
-**Check version** and **Open releases page**. Hovering the gear shows the version
-and current notification state in the status bar. Changes save
-`settings.language` / `settings.show_notifications` and immediately re-translate
-the editor and tray menu.
+The settings window always shows the **Settings tools** sidebar with two
+icon-led pages: **Shortcuts** (⌨, the hotkey list) and **Power** (⏻). Switching
+pages uses a short fade-and-slide animation. The header has the **Hotkey** title,
+a subtitle, and a shortcut-count badge. Cards have subtle borders and dark-theme
+inputs throughout.
+
+The top header also has a ⚙ button to the right of **Open hotkeys.json**. It
+opens a small **Quick settings** window containing the language selector
+(English, Français and العربية), **Show notifications** and **Start with window**
+on/off switches (the latter opens the settings window on launch), a
+**Start with Windows** autostart switch, and the
+update panel: **Current version**, **New version**, **Check version** and
+**Open releases page**. Hovering the gear shows the version and current
+notification state in the status bar. Changes save `settings.language` /
+`settings.show_notifications` / `settings.start_with_window` and immediately
+re-translate the editor and tray menu.
+
+On the **Power** page, pick **Sleep**, **Shutdown**, or **Restart**, enter a
+delay in minutes (`0` = now), and click **Schedule**. A large status panel shows
+the pending action. Shutdown and restart ask for confirmation. Scheduling a
+delayed action hides the settings window and replaces it with a tiny always-on-top
+countdown showing the action and `mm:ss`; **Cancel** (or closing it) cancels the
+action and brings the settings window back. The tray menu also gains
+**Cancel …**; quitting the app cancels the timer too. On laptops using Modern Standby
+(S0 Low Power Idle), Windows rejects the legacy suspend API; the app then locks
+the PC and turns the display off, which is the supported way to trigger Modern
+Standby.
 العربية switches the whole interface to right-to-left layout; reopen the macro
 control window to translate that one. Invalid values fall back to English with
 a warning in the log.
@@ -242,7 +262,8 @@ global hotkey that shares its combo with a scoped one.
 | `paste` | Type the clipboard as plain text | *(no value)* |
 | `media` | `play_pause` `next` `prev` `stop` `volume_up` `volume_down` `mute` | `"volume_up"` |
 | `window` | `left` `right` `top` `bottom` `maximize` `minimize` `restore` `center` `topmost` `close` | `"left"` |
-| `system` | `lock` `sleep` `screenshot` `recycle` `taskmanager` | `"screenshot"` |
+| `pin` | `toggle` `pin` `unpin` — pins the window active when the combo fires | `"toggle"` |
+| `system` | `lock` `sleep` `shutdown` `screenshot` `recycle` `taskmanager` | `"screenshot"` |
 | `app` | `settings` `reload` `suspend` `config` `log` `quit` | `"reload"` |
 
 #### Extra options (top level next to `value`)
@@ -301,7 +322,7 @@ Windows startup never duplicates it.
 
 ## Autostart
 
-Use the tray menu (**Start with Windows**), the editor checkbox, or
+Use the tray menu (**Start with Windows**), the ⚙ **Quick settings** window, or
 `install-autostart.bat`. It writes a single value under
 
 ```text
@@ -338,7 +359,8 @@ hotkey\
 Runtime data lives in `%LOCALAPPDATA%\Hotkey\`:
 
 - `hotkey.log` — errors and hotkey activity (rotated, 128 KB × 2)
-- `hotkey.ico`, `hotkey-paused.ico` — cached tray icons
+- `hotkey.ico`, `hotkey-paused.ico` — cached tray/window icons, regenerated when
+  the icon design version changes (`hotkey-icon-version.txt`)
 
 ---
 
