@@ -125,12 +125,15 @@ app is running is enough if `reload_on_change` is `true` (default).
 | Key | Meaning |
 |---|---|
 | `show_notifications` | Tray balloons for reloads and errors |
-| `start_with_window` | Open the settings window when the app starts (default `false`) |
+| `start_with_window` | Ignored — startup is always tray-only (legacy key) |
 | `notify_on_start` | Balloon when the app starts |
 | `reload_on_change` | Watch `hotkeys.json` and apply edits automatically |
 | `language` | Interface language: `en`, `fr` or `ar` (default `en`) |
 | `typing_delay_ms` | Delay between typed characters (0–50 ms) |
 | `hold_ms` | Long-press / double-click threshold in ms (150–3000, default 400) |
+| `leader_timeout_ms` | Time to wait for the next key in a leader sequence (default 1200) |
+| `macro_start_hotkey` | Global key that opens/starts the macro control window (default unset) |
+| `macro_stop_hotkey` | Global key that stops/cancels macro playback (default unset) |
 | `suspend_hotkey` | Shortcut that pauses/resumes everything (always active) |
 | `update_check` | Check GitHub for a newer release on startup (default `true`) |
 | `update_private` | Skip network calls until a token is set (default `false`) |
@@ -147,14 +150,18 @@ inputs throughout.
 
 The top header also has a ⚙ button to the right of **Open hotkeys.json**. It
 opens a small **Quick settings** window containing the language selector
-(English, Français and العربية), **Show notifications** and **Start with window**
-on/off switches (the latter opens the settings window on launch), a
+(English, Français and العربية), a **Show notifications** switch, a
 **Start with Windows** autostart switch, and the
 update panel: **Current version**, **New version**, **Check version** and
 **Open releases page**. Hovering the gear shows the version and current
 notification state in the status bar. Changes save `settings.language` /
-`settings.show_notifications` / `settings.start_with_window` and immediately
-re-translate the editor and tray menu.
+`settings.show_notifications` and immediately re-translate the editor and tray
+menu.
+
+Startup is always silent: only the system-tray icon appears, even when the
+legacy `start_with_window` key is `true`. The settings window opens only when
+you ask for it — by double-clicking the tray icon, using its menu/hotkey, or
+passing `--settings`.
 
 On the **Power** page, pick **Sleep**, **Shutdown**, or **Restart**, enter a
 delay in minutes (`0` = now), and click **Schedule**. A large status panel shows
@@ -201,6 +208,7 @@ Every hotkey has a **Trigger** (editor dropdown or `"trigger"` in JSON):
 | Trigger | Fires when |
 |---|---|
 | `press` (default) | The key goes down — same as before |
+| `tap` | The key is released (fires on key-up, even after a long hold) |
 | `double` | The key is pressed twice within `hold_ms` |
 | `hold` | The key has been held for `hold_ms` (default 400 ms) |
 
@@ -248,7 +256,9 @@ By default a hotkey works in **every** app. Set **Only in app** in the editor
 
 Global hotkeys still use `RegisterHotKey`. App-scoped hotkeys use the passive
 keyboard hook (Windows' native hotkeys cannot filter by window), and so does a
-global hotkey that shares its combo with a scoped one.
+global hotkey that shares its combo with a scoped one. If another app already
+owns a native combo, the app automatically falls back to the hook so the hotkey
+still fires — the other app may react too, so pick a rare combo when possible.
 
 ### Actions
 
@@ -497,6 +507,8 @@ letter or arrow cannot be used as a global macro key — use a combo, an
   config uses one. Only a bound side button (`Mouse4`/`Mouse5`) is swallowed,
   so other apps stop seeing that button; left/right/middle clicks always get
   through, even when they are part of a chord such as `Mouse5+MouseLeft`.
+  Button presses synthesized by a mouse driver or remote client are accepted;
+  only this app's own macro playback is ignored.
 - If a side button has its own hotkey *and* appears in a chord, the chord
   wins: the single hotkey fires when you release the button without
   completing the chord (`Mouse5` alone copies, `Mouse5+Mouse4` runs only the

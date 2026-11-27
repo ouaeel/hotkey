@@ -44,6 +44,13 @@ def _test_keys() -> str:
         except keys.HotkeyError:
             continue
         raise AssertionError(f"{bad!r} should be rejected")
+    try:
+        keys.parse("delete")
+    except keys.HotkeyError:
+        pass
+    else:
+        raise AssertionError("bare delete should be rejected as a hotkey")
+    assert keys.parse("delete", allow_bare=True) == (0, 0x2E)
     # Recorder names must never reach name_to_vk unchanged: "left" is the
     # left arrow key, not the left mouse button.
     assert keys.normalize_mouse_button("x1") == "mouse4"
@@ -202,6 +209,18 @@ def _test_config() -> str:
         with open(bad, "w", encoding="utf-8") as fh:
             fh.write("{ nope")
         assert config.load(bad).errors
+        flags = os.path.join(tmp, "flags.json")
+        config.save_raw(flags, {
+            "version": 1, "settings": {}, "hotkeys": [
+                {"keys": "ctrl+alt+f24", "action": "open", "value": "x",
+                 "enabled": "false"},
+                {"keys": "ctrl+alt+f23", "action": "open", "value": "x",
+                 "enabled": "true"},
+            ],
+        })
+        flag_cfg = config.load(flags)
+        assert [e.enabled for e in flag_cfg.entries] == [False, True], (
+            flag_cfg.entries, flag_cfg.warnings)
     return f"{len(config.DEFAULT_HOTKEYS)} starter hotkeys"
 
 
@@ -378,6 +397,15 @@ def _test_app_scope() -> str:
     assert only.feed_down(74, 0, 2.0, "notepad.exe") == []
     only.feed_up(74, 2.1)
     assert [b.index for b in only.feed_down(74, 0, 3.0, "chrome.exe")] == [2]
+    # a tap must re-check the scope when the button is released elsewhere
+    tap = Binding(index=3, mods=0, vks=(74,), trigger="tap",
+                  apps=frozenset({"chrome.exe"}))
+    taps = TriggerEngine([tap])
+    assert taps.feed_down(74, 0, 4.0, "chrome.exe") == []
+    assert taps.feed_up(74, 4.1, "explorer.exe") == []
+    assert [b.index for b in taps.feed_up(74, 4.2, "chrome.exe")] == []
+    assert taps.feed_down(74, 0, 5.0, "chrome.exe") == []
+    assert [b.index for b in taps.feed_up(74, 5.1, "chrome.exe")] == [3]
     # config round-trip keeps the scope
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "scoped.json")
@@ -491,6 +519,18 @@ def _test_macro_control() -> str:
     # a hotkey only loads the macro; the following real start must still work
     actions.run(entry, ctx, prepare_only=True)
     assert not control.snapshot()["running"]
+    # A second hotkey press during playback must not reset shared state.
+    control.running = True
+    control._stop = True
+    try:
+        actions.run(entry, ctx, prepare_only=True)
+    except actions.ActionError:
+        pass
+    else:
+        raise AssertionError("prepare_only reset a running macro")
+    assert control.running and control._stop
+    control.running = False
+    control._stop = False
     actions.run(entry, ctx)
     deadline = time.time() + 2.0
     while control.snapshot()["running"] and time.time() < deadline:
@@ -628,32 +668,38 @@ def _test_update() -> str:
 def _test_update_status() -> str:
     from .app import App
 
-    app = App.__new__(App)
-    app.hwnd = 0
-    app.use_tray = False
-    app.cfg = config.Config(path="")
-    app.cfg.settings.update({
-        "language": "en",
-        "update_private": True,
-        "update_url": update.DEFAULT_URL,
-        "update_token": "",
-        "update_token_env": update.DEFAULT_TOKEN_ENV,
-    })
-    app._update_info = None
-    app._update_manual = False
-    app._update_busy = False
-    app.update_events = queue.Queue(maxsize=4)
-    app._update_state = {
-        "state": "idle", "version": "", "message": "Not checked yet",
-        "kwargs": {}, "url": update.DEFAULT_URL,
-    }
-    app._check_updates(manual=True)
-    status = app.update_events.get_nowait()
-    assert status["state"] == "blocked", status
-    assert status["message"] == "Add a GitHub token to check this private repo"
-    assert app.update_snapshot()["current"] == update.__version__
-    assert app._releases_url() == "https://github.com/ouaeel/hotkey/releases"
-    return "gear status events"
+    # Ambient tokens must not turn this hermetic check into a live request.
+    old_token = os.environ.pop(update.DEFAULT_TOKEN_ENV, None)
+    try:
+        app = App.__new__(App)
+        app.hwnd = 0
+        app.use_tray = False
+        app.cfg = config.Config(path="")
+        app.cfg.settings.update({
+            "language": "en",
+            "update_private": True,
+            "update_url": update.DEFAULT_URL,
+            "update_token": "",
+            "update_token_env": update.DEFAULT_TOKEN_ENV,
+        })
+        app._update_info = None
+        app._update_manual = False
+        app._update_busy = False
+        app.update_events = queue.Queue(maxsize=4)
+        app._update_state = {
+            "state": "idle", "version": "", "message": "Not checked yet",
+            "kwargs": {}, "url": update.DEFAULT_URL,
+        }
+        app._check_updates(manual=True)
+        status = app.update_events.get_nowait()
+        assert status["state"] == "blocked", status
+        assert status["message"] == "Add a GitHub token to check this private repo"
+        assert app.update_snapshot()["current"] == update.__version__
+        assert app._releases_url() == "https://github.com/ouaeel/hotkey/releases"
+        return "gear status events"
+    finally:
+        if old_token is not None:
+            os.environ[update.DEFAULT_TOKEN_ENV] = old_token
 
 
 def _test_audit_fixes() -> str:
@@ -814,10 +860,32 @@ def _test_power_actions() -> str:
         else:
             raise AssertionError("unsupported power action was accepted")
 
+        try:
+            fake.schedule_power_action("sleep", float("nan"))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("NaN delay was accepted")
+
         entry = config.Entry(keys="ctrl+alt+f24", action="system",
                              value="shutdown")
         actions.run(entry, fake)
         assert calls[-1] == "shutdown", calls
+        entry = config.Entry(keys="ctrl+alt+f24", action="system",
+                             value="restart")
+        actions.run(entry, fake)
+        assert calls[-1] == "restart", calls
+        old_recycle = win32.empty_recycle_bin
+        win32.empty_recycle_bin = lambda: 1
+        try:
+            actions.run(config.Entry(keys="ctrl+alt+f24", action="system",
+                                     value="recycle"), fake)
+        except actions.ActionError:
+            pass
+        else:
+            raise AssertionError("failed recycle was reported as success")
+        finally:
+            win32.empty_recycle_bin = old_recycle
     finally:
         if fake is not None:
             fake.cancel_power_action(notify=False)
@@ -901,6 +969,154 @@ def _test_restart_api() -> str:
     return "EWX_REBOOT + privilege"
 
 
+def _test_injected_clicks() -> str:
+    """Third-party injected clicks work; only our macro clicks are ignored."""
+    from . import hooks
+
+    assert hooks._is_our_injection(0x01, win32.INJECT_TAG)
+    assert not hooks._is_our_injection(0x01, 0)
+    assert not hooks._is_our_injection(0x00, win32.INJECT_TAG)
+
+    sent = []
+    old_send = win32._send
+    win32._send = lambda inputs: sent.extend(inputs)
+    try:
+        win32.send_mouse("x1", True)
+    finally:
+        win32._send = old_send
+    assert len(sent) == 1 and sent[0].mi.dwExtraInfo == win32.INJECT_TAG
+    return "driver-injected clicks accepted"
+
+
+def _test_native_fallback() -> str:
+    """Native hotkeys stolen by other apps still fire through the hook."""
+    from .app import ID_SUSPEND, App
+
+    mods, vk = keys.parse("ctrl+alt+f24")
+    entry = config.Entry(
+        keys="ctrl+alt+f24", action="run", value="x", index=7,
+        enabled=True, mods=mods, vk=vk, vks=(vk,))
+    cfg = config.Config(path="")
+    cfg.entries.append(entry)
+    cfg.settings["suspend_hotkey"] = "ctrl+alt+f23"
+
+    app = App.__new__(App)
+    app.hwnd = 0
+    app.cfg = cfg
+    app.use_tray = False
+    app._paused = False
+    app.suspended = False
+    app._failures = []
+    app._registered = set()
+    app._by_id = {}
+    app._entries_by_index = {entry.index: entry}
+    captured: dict = {}
+    app._stop_hook = lambda: None
+    app._start_hook = lambda bindings, mouse_bindings=(), leader_timeout_ms=None: (
+        captured.update(bindings=list(bindings), mouse=list(mouse_bindings)))
+
+    old_register = win32.user32.RegisterHotKey
+    win32.user32.RegisterHotKey = lambda *_a: 0
+    try:
+        app._register_all()
+    finally:
+        win32.user32.RegisterHotKey = old_register
+
+    assert app._failures == [], app._failures
+    indexes = {b.index for b in captured.get("bindings", [])}
+    assert entry.index in indexes, indexes
+    assert ID_SUSPEND in indexes, indexes
+    suspend_entry = app._entries_by_index[ID_SUSPEND]
+    assert (suspend_entry.action, suspend_entry.value) == ("app", "suspend")
+    return "2 native fallbacks"
+
+
+def _test_editor_trigger_roundtrip() -> str:
+    """Reopening/saving a hold/double/tap entry must keep its trigger."""
+    import tkinter as tk
+
+    from . import gui
+
+    class DummyApp:
+        def profile_names(self):
+            return []
+
+        def pause_hotkeys(self, *_args, **_kwargs):
+            return None
+
+    class DummyOwner:
+        def __init__(self):
+            self.root = tk.Tk()
+            self.root.withdraw()
+            self.root.wait_window = lambda *_a, **_k: None
+            self.pal = gui._palette()
+            self.scale = 1.0
+            self.lang = "en"
+            self.app = DummyApp()
+            self.entries = []
+
+    for trigger in ("press", "hold", "double", "tap"):
+        owner = DummyOwner()
+        try:
+            entry = config.Entry(
+                keys="Mouse5", action="keys", value="ctrl+a",
+                description="copy all", trigger=trigger, index=0,
+                mods=0, vks=(6,), vk=6)
+            editor = gui.Editor(owner, entry)
+            expected = gui._trigger_label(trigger, editor.t)
+            shown = editor.var_trigger.get()
+            assert shown == expected, (trigger, shown, expected)
+            choices = tuple(editor.cmb_trigger.cget("values"))
+            assert gui._trigger_label("tap", editor.t) in choices, choices
+            editor._save()
+            assert editor.result is not None, trigger
+            assert editor.result.trigger == trigger, (
+                trigger, editor.result.trigger)
+        finally:
+            try:
+                owner.root.destroy()
+            except Exception:
+                pass
+    return "hold/double/tap preserved"
+
+
+def _test_silent_startup() -> str:
+    """A legacy start_with_window=true must never open the settings UI."""
+    from .app import App
+
+    app = App.__new__(App)
+    app.path = ""
+    app.use_tray = False
+    app.hwnd = 0
+    app.engine = None
+    app._by_id = {}
+    app._failures = []
+    app.cfg = config.Config(path="")
+    app.cfg.settings["start_with_window"] = True
+    app.cfg.settings["notify_on_start"] = False
+
+    calls: list[str] = []
+    opened: list[bool] = []
+    app._create_window = lambda: calls.append("window")
+    app.load = lambda initial: calls.append(f"load:{initial}")
+    app._register_all = lambda: calls.append("register")
+    app._update_tray = lambda: calls.append("tray")
+    app._schedule_update_check = lambda _delay: calls.append("update")
+    app.open_settings = lambda: opened.append(True)
+    app.notify = lambda *_a, **_k: calls.append("notify")
+    app._loop = lambda: 0
+
+    old_set_timer = win32.user32.SetTimer
+    win32.user32.SetTimer = lambda *_a: 1
+    try:
+        assert app.start() == 0
+    finally:
+        win32.user32.SetTimer = old_set_timer
+    assert opened == [], "settings window opened during startup"
+    assert "load:True" in calls and "register" in calls, calls
+    return "tray-only startup, legacy key ignored"
+
+
 def run(config_path: str, full: bool = False) -> int:
     print("Hotkey self-test")
     print(f"  python      {sys.version.split()[0]}")
@@ -924,6 +1140,10 @@ def run(config_path: str, full: bool = False) -> int:
     results.check("power schedule", _test_power_actions)
     results.check("suspend power API", _test_suspend_power_api)
     results.check("restart power API", _test_restart_api)
+    results.check("injected mouse clicks", _test_injected_clicks)
+    results.check("native hotkey fallback", _test_native_fallback)
+    results.check("editor trigger round-trip", _test_editor_trigger_roundtrip)
+    results.check("silent startup", _test_silent_startup)
     results.check("validation + safe macro keys", _test_validation)
     results.check("update checker", _test_update)
     results.check("gear update status", _test_update_status)

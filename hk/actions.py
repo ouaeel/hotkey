@@ -33,7 +33,8 @@ WINDOW_OPS = ["left", "right", "top", "bottom", "maximize", "minimize",
 
 PIN_OPS = ["toggle", "pin", "unpin"]
 
-SYSTEM_OPS = ["lock", "sleep", "shutdown", "screenshot", "recycle", "taskmanager"]
+SYSTEM_OPS = ["lock", "sleep", "shutdown", "restart", "screenshot",
+              "recycle", "taskmanager"]
 
 APP_OPS = ["settings", "reload", "suspend", "config", "log", "quit"]
 
@@ -164,7 +165,7 @@ def _center(hwnd: int) -> None:
 def _send_keys(value: str, delay_ms: int = 40) -> None:
     for part in [p.strip() for p in value.split(",") if p.strip()]:
         try:
-            mods, vk = keys.parse(part)
+            mods, vk = keys.parse(part, allow_bare=True)
         except keys.HotkeyError as exc:
             raise ActionError(str(exc)) from exc
         win32.send_combo(mods, vk)
@@ -290,10 +291,14 @@ def run(entry, ctx, prepare_only: bool = False) -> str:
             win32.suspend_pc()
         elif op == "shutdown":
             win32.shutdown_pc()
+        elif op == "restart":
+            win32.restart_pc()
         elif op == "screenshot":
             win32.open_target("ms-screenclip:")
         elif op == "recycle":
-            win32.empty_recycle_bin()
+            result = win32.empty_recycle_bin()
+            if result != 0:
+                raise ActionError(f"could not empty recycle bin ({result})")
         elif op == "taskmanager":
             _run_command("taskmgr.exe", None)
         else:
@@ -364,6 +369,9 @@ def run(entry, ctx, prepare_only: bool = False) -> str:
         # Loading a macro into the control window must not take the playback
         # lock - only actual playback does, and the worker releases it.
         if prepare_only:
+            if (getattr(control, "running", False)
+                    or _MACRO_LOCK.locked()):
+                raise ActionError("a macro is already running")
             control.prepare(steps, entry.display, entry=entry, speed=saved_speed)
             return f"macro ready ({len(steps)} steps)"
 

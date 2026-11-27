@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import gc
 import json
+import math
 import queue
 import threading
 import time
@@ -592,7 +593,7 @@ class SettingsWindow:
         status = self._power_snapshot()
         if not status.get("active"):
             elapsed = time.monotonic() - float(state.get("started", 0))
-            if elapsed >= max(0.0, float(state.get("delay", 0)) - 0.75):
+            if elapsed >= max(0.0, float(state.get("delay", 0)) * 60.0 - 0.75):
                 # Timer fired (or the PC is going away): end the settings
                 # window too, so the tray can open a fresh one afterwards.
                 self._close_countdown(restore=False)
@@ -666,17 +667,6 @@ class SettingsWindow:
         self._lang_win_notify.pack(side=start)
         self._lang_win_notify_var = notify_var
 
-        start_row = ttk.Frame(body)
-        start_row.pack(fill="x", pady=(8, 0))
-        start_var = tk.BooleanVar(
-            master=win,
-            value=bool(self.settings.get("start_with_window", False)))
-        self._lang_win_start = ttk.Checkbutton(
-            start_row, text=self.t("Start with window"),
-            variable=start_var, justify=just)
-        self._lang_win_start.pack(side=start)
-        self._lang_win_start_var = start_var
-
         auto_row = ttk.Frame(body)
         auto_row.pack(fill="x", pady=(8, 0))
         autostart_var = tk.BooleanVar(
@@ -742,7 +732,6 @@ class SettingsWindow:
         def apply() -> None:
             code = i18n.code_from_display(combo.get(), self.lang)
             enabled = bool(notify_var.get())
-            start_window = bool(start_var.get())
             autostart = bool(autostart_var.get())
             auto_changed = autostart != bool(self.app.autostart_enabled())
             changes: dict[str, object] = {}
@@ -750,13 +739,11 @@ class SettingsWindow:
                 changes["language"] = code
             if enabled != self._notifications_enabled():
                 changes["show_notifications"] = enabled
-            if start_window != bool(self.settings.get("start_with_window", False)):
-                changes["start_with_window"] = start_window
             if not changes and not auto_changed:
                 close()
                 return
-            if changes and not self._apply_preference_changes(changes):
-                return
+            # Do the registry write first: if it fails, no preferences have
+            # been saved and the visible UI still matches the stored language.
             if auto_changed:
                 try:
                     self.app.set_autostart(autostart)
@@ -767,6 +754,8 @@ class SettingsWindow:
                         self.t("Could not update autostart:\n{error}", error=exc),
                         parent=self.root)
                     return
+            if changes and not self._apply_preference_changes(changes):
+                return
             close()
             if "language" in changes:
                 self.lang = code
@@ -780,10 +769,6 @@ class SettingsWindow:
                 messages.append(
                     self.t("Notifications enabled") if enabled
                     else self.t("Notifications disabled"))
-            if "start_with_window" in changes:
-                messages.append(
-                    self.t("Start with window enabled") if start_window
-                    else self.t("Start with window disabled"))
             if auto_changed:
                 messages.append(
                     self.t("Autostart enabled") if autostart
@@ -883,7 +868,7 @@ class SettingsWindow:
             except ValueError:
                 status_var.set(self.t("Enter minutes (0-1440)."))
                 return
-            if delay < 0 or delay > 1440:
+            if not math.isfinite(delay) or delay < 0 or delay > 1440:
                 status_var.set(self.t("Enter minutes (0-1440)."))
                 return
             shown = str(int(delay)) if delay.is_integer() else f"{delay:g}"
@@ -1990,7 +1975,13 @@ class Editor:
         form.bind("<Configure>", lambda _e: self._queue_scroll_refresh())
         canvas.bind("<Configure>", lambda _e: self._queue_scroll_refresh())
         self.top.bind("<MouseWheel>", self._on_mousewheel)
-        self.top.bind("<Destroy>", lambda _e: self._stop_jobs())
+        def on_destroy(event) -> None:
+            # Child widgets also send <Destroy> to the toplevel bindtag.
+            # Only the dialog itself going away should cancel its jobs.
+            if event.widget is self.top:
+                self._stop_jobs()
+
+        self.top.bind("<Destroy>", on_destroy)
         form.columnconfigure(value_col, weight=1)
 
         # shortcut
@@ -2046,12 +2037,16 @@ class Editor:
         self._trigger_by_label = {self.t(label): key
                                   for key, label in TRIGGER_LABELS.items()}
         self._trigger_choices = [self.t(TRIGGER_LABELS[k])
-                                 for k in ("press", "double", "hold")]
+                                 for k in ("press", "double", "hold", "tap")]
         self._trigger_press = self.t(TRIGGER_LABELS["press"])
         trigger_key = self.original.trigger if self.original else "press"
+        # Map the stored trigger key ("hold") to its display label.  Looking
+        # the key up in _trigger_by_label (which is keyed by labels) always
+        # fell back to "press", so reopening a hold/double entry showed
+        # Instant and saving silently downgraded the trigger.
         self.var_trigger = tk.StringVar(
             master=self.top,
-            value=self._trigger_by_label.get(trigger_key, self._trigger_press))
+            value=_trigger_label(trigger_key, self.t))
         self.cmb_trigger = ttk.Combobox(form, textvariable=self.var_trigger, state="readonly",
                                        values=self._trigger_choices, justify=just)
         self.cmb_trigger.grid(row=5, column=0, columnspan=2, sticky="ew")

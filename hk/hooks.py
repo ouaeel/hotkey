@@ -51,6 +51,16 @@ MODIFIER_VKS = frozenset((0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2,
                           0xA3, 0xA4, 0xA5))
 
 
+def _is_our_injection(flags: int, extra: int) -> bool:
+    """True only for synthetic clicks made by our own macro engine.
+
+    Some mouse drivers and remote-desktop clients mark real button presses as
+    injected too.  Ignoring every injected event made side-button hotkeys
+    intermittently do nothing, so match our private tag instead.
+    """
+    return bool(flags & 0x00000001) and int(extra) == win32.INJECT_TAG
+
+
 class KBDLLHOOKSTRUCT(Structure):
     _fields_ = [("vkCode", c_uint32), ("scanCode", c_uint32), ("flags", c_uint32),
                 ("time", c_uint32), ("dwExtraInfo", ctypes.c_size_t)]
@@ -147,6 +157,12 @@ class TriggerEngine:
 
     def needs_app(self, vk: int) -> bool:
         return vk in self._scoped_vks
+
+    @staticmethod
+    def _scope_ok(b: Binding, app: str | None) -> bool:
+        """Re-check scope when a deferred trigger actually completes."""
+        return not (b.apps and app is not None
+                    and not win32.app_matches(b.apps, app))
 
     def _eligible(self, app: str) -> list[Binding]:
         matched = [b for b in self.bindings
@@ -313,7 +329,8 @@ class TriggerEngine:
                 # tap/double alone replaces press entirely.
         return fired
 
-    def feed_up(self, vk: int, now: float) -> list[Binding]:
+    def feed_up(self, vk: int, now: float,
+                app: str | None = None) -> list[Binding]:
         self.pressed.discard(vk)
         self._down_at.pop(vk, None)
         fired: list[Binding] = []
@@ -325,15 +342,16 @@ class TriggerEngine:
                 # A matured hold already cancelled the tap.  Otherwise a
                 # release always completes it: an elapsed-time cut-off here
                 # made a long hold on a chord-sharing button fire nothing.
-                fired.append(b)
-                self._cancel_siblings(b)
+                if self._scope_ok(b, app):
+                    fired.append(b)
+                    self._cancel_siblings(b)
         # A press that was waiting on a hold fires only if the hold never
         # matured (i.e. the button was released before hold_ms).
         for idx, (b, _started, _hold_idx, deadline) in list(
                 self._pending_press.items()):
             if b.vks[0] == vk:
                 self._pending_press.pop(idx, None)
-                if now < deadline:
+                if now < deadline and self._scope_ok(b, app):
                     fired.append(b)
         for idx, (b, _) in list(self._hold.items()):
             if b.vks[0] == vk:
@@ -382,7 +400,8 @@ class TriggerEngine:
         for key, (b, deadline) in list(self._deferred.items()):
             if now >= deadline:
                 self._deferred.pop(key, None)
-                fired.append(b)
+                if self._scope_ok(b, app):
+                    fired.append(b)
         return fired
 
     def next_deadline(self) -> float | None:
@@ -486,10 +505,10 @@ class _MouseHookProc:
                 msg = int(wparam)
                 info = ctypes.cast(ctypes.c_void_p(lparam),
                                    POINTER(MSLLHOOKSTRUCT)).contents
-                # SendInput() marks macro-generated clicks as injected.  Feeding
-                # those back into the trigger engine makes a macro that clicks a
-                # mouse-button hotkey fire itself over and over.
-                if info.flags & 0x00000001:  # LLMHF_INJECTED
+                # Ignore only our own macro playback.  Third-party injected
+                # clicks (gaming mice, remote desktop) are real user input and
+                # must still reach the trigger engine.
+                if _is_our_injection(info.flags, info.dwExtraInfo):
                     return win32.user32.CallNextHookEx(0, ncode, wparam, lparam)
                 event = MOUSE_MESSAGES.get(msg)
                 if event is None and msg in (WM_XBUTTONDOWN, WM_XBUTTONUP):

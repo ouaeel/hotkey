@@ -219,9 +219,14 @@ def format_sequence(steps) -> str:
     return " > ".join(format_many(mods, vks) for mods, vks in steps)
 
 
-def parse(combo: str) -> tuple[int, int]:
-    """Parse 'ctrl+alt+t' into (modifier mask, virtual-key code)."""
-    mods, vks = parse_all(combo)
+def parse(combo: str, allow_bare: bool = False) -> tuple[int, int]:
+    """Parse 'ctrl+alt+t' into (modifier mask, virtual-key code).
+
+    ``allow_bare`` is for synthetic keystrokes, where a bare key such as
+    ``delete`` is safe: the bare-key rule only protects global hotkey
+    registration from hijacking ordinary typing.
+    """
+    mods, vks = parse_all(combo, allow_bare=allow_bare)
     if len(vks) != 1:
         raise HotkeyError(f"{combo!r} is a chord; the hook engine handles those")
     return mods, vks[0]

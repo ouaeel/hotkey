@@ -10,7 +10,7 @@ from . import i18n, keys, update
 
 DEFAULT_SETTINGS: dict = {
     "show_notifications": True,
-    "start_with_window": False,
+    "start_with_window": False,  # deprecated: startup is always tray-only
     "notify_on_start": False,
     "reload_on_change": True,
     "typing_delay_ms": 2,
@@ -265,6 +265,21 @@ def entry_is_active(entry: Entry, profile: str) -> bool:
     return any(p.casefold() == want for p in entry.profiles)
 
 
+def _enabled_flag(value, where: str, warnings: list[str]) -> bool:
+    """Interpret ``enabled`` without treating the string "false" as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().casefold()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off", ""):
+            return False
+        warnings.append(f"{where}: unknown enabled value {value!r}; using true")
+        return True
+    return bool(value)
+
+
 def _entry_from_json(item: dict, index: int, errors: list[str],
                      warnings: list[str]) -> Entry | None:
     where = f"hotkey #{index + 1}"
@@ -313,7 +328,7 @@ def _entry_from_json(item: dict, index: int, errors: list[str],
         value=str(value),
         extra=extra,
         description=str(item.get("description", "") or ""),
-        enabled=bool(item.get("enabled", True)),
+        enabled=_enabled_flag(item.get("enabled", True), where, warnings),
         mods=mods,
         vk=vks[0] if vks else 0,
         vks=vks,

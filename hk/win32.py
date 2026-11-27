@@ -18,6 +18,11 @@ from . import keys as _keys
 
 log = logging.getLogger("hotkey")
 
+# Tag synthetic clicks made by this app's macro engine.  The mouse hook can
+# then ignore only its own playback instead of every injected click (some
+# mouse drivers inject real button presses too).
+INJECT_TAG = 0x484B0001  # "HK"
+
 MOD_ALT = _keys.MOD_ALT
 MOD_CONTROL = _keys.MOD_CONTROL
 MOD_SHIFT = _keys.MOD_SHIFT
@@ -28,7 +33,7 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 try:
-    powrprof = ctypes.WinDLL("powrprof")
+    powrprof = ctypes.WinDLL("powrprof", use_last_error=True)
 except OSError:  # pragma: no cover - older / stripped systems
     powrprof = None
 
@@ -235,6 +240,8 @@ user32.LoadImageW.argtypes = [HINSTANCE, LPCWSTR, UINT, c_int, c_int, UINT]
 user32.LoadImageW.restype = HANDLE
 user32.LoadIconW.argtypes = [HINSTANCE, c_void_p]
 user32.LoadIconW.restype = HICON
+user32.DestroyIcon.argtypes = [HICON]
+user32.DestroyIcon.restype = ctypes.c_int
 user32.CreatePopupMenu.restype = HMENU
 user32.AppendMenuW.argtypes = [HMENU, UINT, ctypes.c_size_t, LPCWSTR]
 user32.TrackPopupMenu.argtypes = [HMENU, UINT, c_int, c_int, c_int, HWND, c_void_p]
@@ -497,13 +504,24 @@ def set_window_icon(hwnd: int, path: str) -> bool:
     """Set a Tk window's native icon (title bar and taskbar button).
 
     ``wm iconbitmap`` alone does not always produce a WM_SETICON handle on
-    Windows, so send it explicitly as well.
+    Windows, so send it explicitly as well.  A file-backed icon loaded with
+    ``LoadImageW`` is ours to destroy; the shared IDI_APPLICATION fallback is
+    not.
     """
-    hicon = load_icon(path)
+    hicon = 0
+    owned = False
+    if path and os.path.isfile(path):
+        hicon = int(user32.LoadImageW(None, path, IMAGE_ICON, 0, 0,
+                                      LR_LOADFROMFILE | LR_DEFAULTSIZE) or 0)
+        owned = bool(hicon)
+    if not hicon:
+        hicon = int(user32.LoadIconW(None, c_void_p(32512)) or 0)
     if not hicon:
         return False
     user32.SendMessageW(HWND(hwnd), WM_SETICON, ICON_SMALL, LPARAM(hicon))
     user32.SendMessageW(HWND(hwnd), WM_SETICON, ICON_BIG, LPARAM(hicon))
+    if owned:
+        user32.DestroyIcon(HICON(hicon))
     return True
 
 
@@ -1073,5 +1091,5 @@ def send_mouse(button: str, down: bool) -> None:
     inp.mi.mouseData = data
     inp.mi.dwFlags = flag
     inp.mi.time = 0
-    inp.mi.dwExtraInfo = 0
+    inp.mi.dwExtraInfo = INJECT_TAG
     _send([inp])

@@ -16,6 +16,7 @@ import argparse
 import ctypes
 import json
 import logging
+import math
 import os
 import queue
 import signal
@@ -217,9 +218,8 @@ class App:
             self.notify(APP_NAME, self.t(
                 "{count} hotkeys active. Double-click the tray icon to edit them.",
                 count=self.active_count))
-        if self.cfg.settings.get("start_with_window"):
-            log.info("opening settings window on start")
-            self.open_settings()
+        # Startup is always silent: only the tray icon appears. The settings
+        # window opens on demand (tray double-click/menu, hotkey or --settings).
         return self._loop()
 
     def _create_window(self) -> None:
@@ -437,7 +437,12 @@ class App:
         self._unregister_all()
         self._stop_hook()
         self._failures = []
+        native: list[config.Entry] = []
+        bindings: list = []
+        mouse_bindings: list = []
         if self._paused:
+            if self._capture_paused:
+                self._start_capture_hook()
             return
         suspend = str(self.cfg.settings.get("suspend_hotkey") or "").strip()
         if suspend:
@@ -447,15 +452,23 @@ class App:
                                                mods | keys.MOD_NOREPEAT, vk):
                     self._registered.add(ID_SUSPEND)
                 else:
-                    self._failures.append(f"{keys.pretty(suspend)} (suspend hotkey in use)")
+                    # Another app owns the native slot. The low-level hook still
+                    # sees the keys, so keep the shortcut working that way.
+                    log.info("suspend hotkey %s in use; using hook fallback",
+                             keys.pretty(suspend))
+                    self._entries_by_index[ID_SUSPEND] = config.Entry(
+                        keys=keys.format_many(mods, (vk,)), action="app",
+                        value="suspend", description="Suspend all hotkeys",
+                        enabled=True, mods=mods, vk=vk, vks=(vk,),
+                        index=ID_SUSPEND)
+                    bindings.append(hooks.Binding(
+                        index=ID_SUSPEND, mods=mods, vks=(vk,),
+                        trigger="press", apps=frozenset()))
             except keys.HotkeyError as exc:
                 self._failures.append(str(exc))
         if self.suspended:
             return
 
-        native: list[config.Entry] = []
-        bindings: list = []
-        mouse_bindings: list = []
         seen: set[tuple[int, frozenset[int], str, tuple[str, ...]]] = set()
         seen_actions: dict[tuple, config.Entry] = {}
         entries = [e for e in self.cfg.entries
@@ -540,8 +553,14 @@ class App:
                 self._registered.add(hid)
                 self._by_id[hid] = entry
             else:
-                self._failures.append(self.t(
-                    "{name} is already used by another app", name=entry.display))
+                # RegisterHotKey fails when another app owns the same combo.
+                # A low-level keyboard hook still receives the key events, so
+                # fall back to it instead of silently dropping the hotkey.
+                log.info("%s: native hotkey in use; using hook fallback",
+                         entry.display)
+                bindings.append(hooks.Binding(
+                    index=entry.index, mods=entry.mods, vks=entry.vks,
+                    trigger="press", apps=frozenset(entry.apps), seq=entry.seq))
 
         if bindings or mouse_bindings:
             self._start_hook(bindings, mouse_bindings)
@@ -618,6 +637,14 @@ class App:
             log.error("mouse capture hook failed: %s", exc)
             self.mouse_hook = None
 
+    def _clear_capture_events(self) -> None:
+        """Discard mouse events left over from a previous capture session."""
+        while True:
+            try:
+                self.capture_events.get_nowait()
+            except queue.Empty:
+                return
+
     def _hook_event(self, kind: str, vk: int) -> bool:
         """Feed one key/mouse event; True means the event was consumed."""
         if self._capture_paused:
@@ -637,7 +664,7 @@ class App:
             now = time.monotonic()
             app = win32.foreground_app() if self.engine.needs_app(vk) else ""
             fired = (self.engine.feed_down(vk, mods, now, app) if kind == "down"
-                     else self.engine.feed_up(vk, now))
+                     else self.engine.feed_up(vk, now, app))
             for b in fired:
                 self._post_fire(b.index)
             hint = self.engine.take_hint() if kind == "down" else None
@@ -921,7 +948,7 @@ class App:
             delay = float(minutes)
         except (TypeError, ValueError):
             raise ValueError("delay must be a number of minutes") from None
-        if delay < 0 or delay > 1440:
+        if not math.isfinite(delay) or delay < 0 or delay > 1440:
             raise ValueError("delay must be between 0 and 1440 minutes")
         self.cancel_power_action(notify=False)
         label = self._power_label(action)
@@ -1138,6 +1165,7 @@ class App:
                 mode = int(wparam)
                 self._paused = mode != 0
                 self._capture_paused = mode == 2
+                self._clear_capture_events()
                 if self._capture_paused:
                     self._unregister_all()
                     self._stop_hook()
@@ -1412,7 +1440,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--validate", action="store_true", help="check the config and exit")
     parser.add_argument("--self-test", action="store_true", help="run built-in diagnostics")
     parser.add_argument("--full", action="store_true",
-                        help="with --self-test: also test the clipboard")
+                        help="run built-in diagnostics including the clipboard")
     parser.add_argument("--install-autostart", action="store_true")
     parser.add_argument("--remove-autostart", action="store_true")
     parser.add_argument("--reload", action="store_true", help="ask the running app to reload")
@@ -1420,6 +1448,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     args = parser.parse_args(argv)
+    if args.full:
+        args.self_test = True
 
     win32.enable_dpi_awareness()
     setup_logging(args.verbose)
@@ -1466,6 +1496,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     mutex = acquire_single_instance()
+    if mutex is not None and (args.quit or args.reload):
+        win32.kernel32.CloseHandle(mutex)
+        print("Hotkey is not running.")
+        return 0
     if mutex is None:
         hwnd = win32.find_window("HotkeyMainWindow")
         if hwnd and args.quit:
